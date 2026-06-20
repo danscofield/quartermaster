@@ -1,0 +1,39 @@
+[package]
+name = "quartermaster"
+version = "0.1.0"
+edition = "2021"
+description = "Workload identity federation broker"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+jsonwebtoken = "9"
+rcgen = { version = "0.13", features = ["x509-parser", "pem"] }
+ring = "0.17"
+untrusted = "0.9"
+time = "0.3"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+base64 = "0.22"
+toml = "0.8"
+cedar-policy = "4"
+aws-sdk-dynamodb = "1"
+aws-config = "1"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "request-id", "catch-panic"] }
+regex = "1"
+reqwest = { version = "0.12", features = ["json"] }
+
+[dev-dependencies]
+proptest = "1"
+axum-test = "15"
+mockall = "0.13"
+tokio-test = "0.4"
+http-body-util = "0.1.3"
+x509-parser = "0.16"
+openssl = "0.10"
