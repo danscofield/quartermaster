@@ -1,0 +1,41 @@
+# Quartermaster — Local Development Configuration
+#
+# Run with: QM_CONFIG_PATH=./example/config.toml cargo run
+
+issuer = "http://localhost:8443"
+token_ttl_secs = 300
+
+[server]
+host = "127.0.0.1"
+port = 8443
+
+# Local file-backed storage (no cloud dependencies)
+[datastore]
+backend = "local"
+
+[datastore.local]
+path = "./data"
+
+# In-memory signing key
+[signing]
+algorithm = "ES256"
+key_path = "./example/keys/signing.pem"
+
+# Local CA for certificate issuance
+[ca]
+key_path = "./example/keys/ca.key.pem"
+cert_path = "./example/keys/ca.cert.pem"
+ttl_secs = 300
+
+# In-memory cache
+[cache]
+backend = "memory"
+ttl_secs = 300
+
+# Rate limiting
+[rate]
+requests_per_minute = 60
+
+# Audit logging — stdout only
+[[audit.sinks]]
+type = "stdout"

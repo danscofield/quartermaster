@@ -26,11 +26,11 @@ pub struct Config {
     #[serde(default = "default_ttl_secs")]
     pub token_ttl_secs: u64,
 
-    /// SPIRE trust domain configuration
-    pub spire: SpireConfig,
+    /// SPIRE trust domain configuration (optional; not needed if using other identity sources)
+    pub spire: Option<SpireConfig>,
 
-    /// DynamoDB configuration (legacy; kept for backward compatibility during migration)
-    pub dynamo: DynamoConfig,
+    /// DynamoDB configuration (legacy; optional when [datastore] is configured)
+    pub dynamo: Option<DynamoConfig>,
 
     /// JWT signing configuration (legacy; kept for backward compatibility during migration)
     pub signing: SigningConfig,
@@ -241,10 +241,12 @@ impl Config {
             });
         }
 
-        if self.spire.trust_domain.trim().is_empty() {
-            return Err(ConfigError {
-                message: "spire.trust_domain must not be empty".to_string(),
-            });
+        if let Some(ref spire) = self.spire {
+            if spire.trust_domain.trim().is_empty() {
+                return Err(ConfigError {
+                    message: "spire.trust_domain must not be empty".to_string(),
+                });
+            }
         }
 
         let valid_algorithms = ["ES256", "ES384", "RS256", "RS384", "RS512", "PS256", "PS384", "PS512"];
@@ -276,16 +278,18 @@ impl Config {
             });
         }
 
-        if self.dynamo.policy_sync_interval_secs == 0 {
-            return Err(ConfigError {
-                message: "dynamo.policy_sync_interval_secs must be greater than 0".to_string(),
-            });
-        }
+        if let Some(ref dynamo) = self.dynamo {
+            if dynamo.policy_sync_interval_secs == 0 {
+                return Err(ConfigError {
+                    message: "dynamo.policy_sync_interval_secs must be greater than 0".to_string(),
+                });
+            }
 
-        if self.dynamo.region.trim().is_empty() {
-            return Err(ConfigError {
-                message: "dynamo.region must not be empty".to_string(),
-            });
+            if dynamo.region.trim().is_empty() {
+                return Err(ConfigError {
+                    message: "dynamo.region must not be empty".to_string(),
+                });
+            }
         }
 
         if self.rate.requests_per_minute == 0 {
@@ -483,8 +487,8 @@ impl Config {
         let config = Config {
             issuer,
             token_ttl_secs: env_parse_or_default("QM_TOKEN_TTL_SECS", default_ttl_secs())?,
-            spire,
-            dynamo,
+            spire: Some(spire),
+            dynamo: Some(dynamo),
             signing,
             ca,
             cache,

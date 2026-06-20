@@ -52,15 +52,17 @@ async fn main() {
             .expect("failed to build datastore from [datastore] config")
     } else {
         // Legacy fallback: build DynamoDataStore from [dynamo] section
+        let dynamo_config = config.dynamo.as_ref()
+            .expect("either [datastore] or [dynamo] section must be present in config");
         let aws_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .region(aws_config::Region::new(config.dynamo.region.clone()))
+            .region(aws_config::Region::new(dynamo_config.region.clone()))
             .load()
             .await;
         Arc::new(quartermaster::datastore::dynamodb::DynamoDataStore::new(
             &quartermaster::config::backends::DynamoDbConfig {
-                region: config.dynamo.region.clone(),
-                billets_table: config.dynamo.billets_table.clone(),
-                policies_table: config.dynamo.policies_table.clone(),
+                region: dynamo_config.region.clone(),
+                billets_table: dynamo_config.billets_table.clone(),
+                policies_table: dynamo_config.policies_table.clone(),
             },
             &aws_config,
         ))
@@ -95,14 +97,16 @@ async fn main() {
     );
 
     // Initialize SVID Validator from SPIRE trust bundle
-    let trust_bundle_json = std::fs::read_to_string(&config.spire.trust_bundle_path)
+    let spire_config = config.spire.as_ref()
+        .expect("[spire] section required when SPIRE identity source is used");
+    let trust_bundle_json = std::fs::read_to_string(&spire_config.trust_bundle_path)
         .expect("failed to read SPIRE trust bundle");
     let trust_bundle_keys = SpireValidator::parse_jwks(&trust_bundle_json)
         .expect("failed to parse SPIRE trust bundle JWKS");
     let validator: Arc<dyn quartermaster::domain::svid::Validator> = Arc::new(
         SpireValidator::new(
             trust_bundle_keys,
-            config.spire.trust_domain.clone(),
+            spire_config.trust_domain.clone(),
             config.issuer.clone(),
         ),
     );
@@ -131,7 +135,7 @@ async fn main() {
     // Initialize PolicySyncService and start background sync
     let policy_sync = Arc::new(PolicySyncService::new(
         Arc::clone(&data_store),
-        config.dynamo.policy_sync_interval_secs,
+        config.dynamo.as_ref().map(|d| d.policy_sync_interval_secs).unwrap_or(30),
         audit_service.clone(),
     ));
     let policy_sync_handle = Arc::clone(&policy_sync).start();
@@ -241,7 +245,7 @@ async fn main() {
             Some(Box::new(SpireValidator::new(
                 SpireValidator::parse_jwks(&trust_bundle_json)
                     .expect("failed to parse SPIRE trust bundle JWKS for dispatcher"),
-                config.spire.trust_domain.clone(),
+                config.spire.as_ref().expect("[spire] required").trust_domain.clone(),
                 config.issuer.clone(),
             ))),
             None, // OIDC validator — configured via IdentityConfig
