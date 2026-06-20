@@ -17,6 +17,10 @@ pub struct DataStoreConfig {
 
     /// Local file-backed configuration (optional; uses defaults if absent).
     pub local: Option<LocalStoreConfig>,
+
+    /// How often to sync policies (seconds). Default: 30.
+    #[serde(default = "default_policy_sync_interval_secs")]
+    pub policy_sync_interval_secs: u64,
 }
 
 /// Available DataStore backend types.
@@ -30,6 +34,10 @@ pub enum DataStoreBackend {
 
 fn default_datastore_backend() -> DataStoreBackend {
     DataStoreBackend::Local
+}
+
+fn default_policy_sync_interval_secs() -> u64 {
+    30
 }
 
 /// DynamoDB backend configuration.

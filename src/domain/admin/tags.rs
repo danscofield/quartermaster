@@ -1,8 +1,8 @@
-/// Tag validation for billet metadata.
-///
-/// Tags must conform to `key:value` format where both key and value are non-empty
-/// and contain only alphanumeric characters, hyphens, underscores, and dots.
-/// The first character of both key and value must be alphanumeric.
+//! Tag validation for billet metadata.
+//!
+//! Tags must conform to `key:value` format where both key and value are non-empty
+//! and contain only alphanumeric characters, hyphens, underscores, and dots.
+//! The first character of both key and value must be alphanumeric.
 
 /// Returns true if the character is a valid tag character (alphanumeric, hyphen, underscore, dot).
 fn is_valid_tag_char(c: char) -> bool {

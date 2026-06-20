@@ -1,3 +1,5 @@
+pub mod kms_authority;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,7 +109,7 @@ impl LocalAuthority {
 
     /// Extract the trust domain from a SPIFFE ID.
     /// e.g., "spiffe://example.org/workload" -> "example.org"
-    fn extract_trust_domain(spiffe_id: &str) -> Result<&str, CertError> {
+    pub(crate) fn extract_trust_domain(spiffe_id: &str) -> Result<&str, CertError> {
         let stripped = spiffe_id.strip_prefix("spiffe://").ok_or_else(|| {
             CertError::InvalidCsr(format!(
                 "SPIFFE ID does not start with spiffe://: {}",
@@ -121,7 +123,7 @@ impl LocalAuthority {
 
     /// Verify the self-signature on a CSR using ring.
     /// Returns the SubjectPublicKeyInfo DER bytes on success.
-    fn verify_csr_signature(csr_der: &[u8]) -> Result<(), CertError> {
+    pub(crate) fn verify_csr_signature(csr_der: &[u8]) -> Result<(), CertError> {
         // A PKCS#10 CSR has the ASN.1 structure:
         // CertificationRequest ::= SEQUENCE {
         //   certificationRequestInfo  CertificationRequestInfo,
@@ -410,7 +412,7 @@ impl Authority for LocalAuthority {
 }
 
 /// Generate a random 20-byte serial number.
-fn generate_random_serial() -> Result<SerialNumber, CertError> {
+pub(crate) fn generate_random_serial() -> Result<SerialNumber, CertError> {
     let rng = SystemRandom::new();
     let mut serial_bytes = [0u8; 20];
     ring::rand::SecureRandom::fill(&rng, &mut serial_bytes)

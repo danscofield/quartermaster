@@ -60,6 +60,17 @@ impl SelectorEnricher for SpireSelectorEnricher {
     }
 }
 
+/// A no-op implementation of SelectorEnricher that always returns an empty list.
+/// Used when SPIRE is not configured.
+pub struct NoOpSelectorEnricher;
+
+#[async_trait::async_trait]
+impl SelectorEnricher for NoOpSelectorEnricher {
+    async fn fetch_selectors(&self, _spiffe_id: &str) -> Result<Vec<String>, SelectorError> {
+        Ok(vec![])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

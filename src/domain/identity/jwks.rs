@@ -365,6 +365,13 @@ impl JwksProvider for JwksManager {
     }
 }
 
+#[async_trait]
+impl JwksProvider for Arc<JwksManager> {
+    async fn get_keys(&self, source_id: &str) -> Result<Vec<DecodingKey>, IdentityError> {
+        self.as_ref().get_keys(source_id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

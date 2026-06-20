@@ -8,10 +8,14 @@ token_ttl_secs = 300
 [server]
 host = "127.0.0.1"
 port = 8443
+# Optional: bind admin routes on a separate address
+# admin_addr = "127.0.0.1:9090"
 
 # Local file-backed storage (no cloud dependencies)
 [datastore]
 backend = "local"
+# How often to sync policies from the datastore (seconds, default: 30)
+policy_sync_interval_secs = 30
 
 [datastore.local]
 path = "./data"
@@ -39,3 +43,44 @@ requests_per_minute = 60
 # Audit logging — stdout only
 [[audit.sinks]]
 type = "stdout"
+
+# ─── Identity Sources (optional) ─────────────────────────────────────────────
+#
+# Configure one or more identity sources for workload authentication.
+# If omitted, only legacy [spire] config (if present) is used.
+#
+# Uncomment and configure the sources relevant to your environment.
+# At least one source must be enabled when [identity] is present.
+
+# --- SPIRE identity source ---
+# [identity.spire]
+# trust_domain = "example.com"
+# jwks_path = "/run/spire/agent/jwks.json"
+# server_addr = "unix:///run/spire/server/api.sock"
+# audience = "quartermaster.example.com"
+
+# --- OIDC identity sources (one or more) ---
+# [[identity.oidc]]
+# prefix = "okta"
+# issuer = "https://mycompany.okta.com/oauth2/default"
+# client_ids = ["0oa1abc2def3ghi4j5k6"]
+# jwks_refresh_interval = "1h"
+# max_staleness = "24h"
+#
+# [[identity.oidc.implicit_claims]]
+# claim = "groups"
+# billet_prefix = "okta-group"
+# in_tokens = false
+
+# --- AWS STS identity source ---
+# [identity.aws_sts]
+# enabled = true
+# allowed_accounts = ["123456789012", "987654321098"]
+
+# --- GCP identity source ---
+# [identity.gcp]
+# enabled = true
+# audience = "quartermaster.example.com"
+# allowed_projects = ["my-project-123"]
+# jwks_refresh_interval = "1h"
+# max_staleness = "24h"

@@ -21,7 +21,6 @@ use crate::domain::identity::entity::MultiSourceEntityBuilder;
 use crate::domain::identity::implicit::ImplicitBilletMapper;
 use crate::domain::identity::jwks::JwksManager;
 use crate::domain::ratelimit::Limiter;
-use crate::domain::svid::Validator;
 use crate::domain::token::Issuer;
 use crate::keymanager::KeyManager;
 use crate::signing::SigningManager;
@@ -32,7 +31,6 @@ use crate::handler;
 /// Shared application state holding all domain components.
 /// Passed to handlers via `axum::extract::State<Arc<AppState>>`.
 pub struct AppState {
-    pub validator: Arc<dyn Validator>,
     pub resolver: Arc<dyn Resolver>,
     pub issuer: Arc<dyn Issuer>,
     pub authority: Arc<dyn Authority>,
@@ -61,9 +59,12 @@ pub struct AppState {
     pub jwks_manager: Option<Arc<JwksManager>>,
 }
 
-/// Builds the axum Router with all routes and middleware applied.
-pub fn build_router(state: Arc<AppState>) -> Router {
-    let app = Router::new()
+/// Builds the data-plane router, conditionally including admin routes.
+///
+/// When `include_admin` is `true`, admin routes (`/admin/*`) are mounted on this router.
+/// When `false`, only data-plane routes are included (admin routes are served on a separate listener).
+pub fn build_main_router(state: Arc<AppState>, include_admin: bool) -> Router {
+    let mut app = Router::new()
         // Data-plane routes
         .route("/token", post(handler::token::token_exchange))
         .route(
@@ -73,8 +74,43 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/jwks.json", get(handler::jwks::jwks))
         .route("/ca/chain.pem", get(handler::ca::ca_chain))
         .route("/healthz", get(handler::health::healthz))
-        .route("/billets/{name}", get(handler::billets::get_billet))
-        // Admin routes
+        .route("/billets/{name}", get(handler::billets::get_billet));
+
+    if include_admin {
+        app = app
+            .route(
+                "/admin/billets",
+                post(handler::admin_billets::create_billet)
+                    .get(handler::admin_billets::list_billets),
+            )
+            .route(
+                "/admin/billets/{name}",
+                get(handler::admin_billets::get_billet)
+                    .put(handler::admin_billets::update_billet)
+                    .delete(handler::admin_billets::delete_billet),
+            )
+            .route(
+                "/admin/billets/{name}/policies",
+                post(handler::admin_billets::create_policy)
+                    .get(handler::admin_billets::list_policies),
+            )
+            .route(
+                "/admin/billets/{name}/policies/{id}",
+                get(handler::admin_billets::get_policy)
+                    .put(handler::admin_billets::update_policy)
+                    .delete(handler::admin_billets::delete_policy),
+            );
+    }
+
+    let app = app.with_state(state);
+    middleware::apply_middleware(app)
+}
+
+/// Builds the admin-only router with `/admin/*` routes and middleware.
+///
+/// Used when the admin listener is on a separate address.
+pub fn build_admin_router(state: Arc<AppState>) -> Router {
+    let app = Router::new()
         .route(
             "/admin/billets",
             post(handler::admin_billets::create_billet)
@@ -100,4 +136,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state);
 
     middleware::apply_middleware(app)
+}
+
+/// Builds the axum Router with all routes and middleware applied.
+///
+/// This is a backward-compatible wrapper that includes both data-plane and admin routes
+/// on a single router. Equivalent to `build_main_router(state, true)`.
+pub fn build_router(state: Arc<AppState>) -> Router {
+    build_main_router(state, true)
 }

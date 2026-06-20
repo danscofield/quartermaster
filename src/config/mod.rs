@@ -62,6 +62,9 @@ pub struct Config {
     /// New pluggable CA backend configuration (optional; uses legacy `ca` if absent)
     pub ca_backend: Option<SigningBackendConfig>,
 
+    /// Identity source configuration (optional; defines how workloads authenticate).
+    pub identity: Option<IdentityConfig>,
+
     /// System billets exempt from resource scope validation.
     /// Defaults to ["quartermaster-admin", "quartermaster-guardrails"] if omitted.
     #[serde(default = "default_system_billets")]
@@ -135,17 +138,12 @@ pub struct CacheConfig {
 }
 
 /// Cache backend type.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CacheBackend {
+    #[default]
     Memory,
     Redis,
-}
-
-impl Default for CacheBackend {
-    fn default() -> Self {
-        Self::Memory
-    }
 }
 
 /// Redis configuration (used when cache backend is redis).
@@ -173,6 +171,10 @@ pub struct ServerConfig {
     /// Bind port
     #[serde(default = "default_port")]
     pub port: u16,
+
+    /// Optional separate bind address for admin routes (e.g., "127.0.0.1:9090").
+    /// When set, admin endpoints are served on this address instead of the main server.
+    pub admin_addr: Option<String>,
 }
 
 // --- Default value functions ---
@@ -315,6 +317,13 @@ impl Config {
 
         if let Some(ref cb) = self.ca_backend {
             self.validate_signing_backend_config(cb, "ca_backend")?;
+        }
+
+        // Validate identity config when present
+        if let Some(ref identity) = self.identity {
+            identity.validate().map_err(|err| ConfigError {
+                message: format!("identity: {}", err),
+            })?;
         }
 
         Ok(())
@@ -482,6 +491,7 @@ impl Config {
         let server = ServerConfig {
             host: env_or_default("QM_SERVER_HOST", default_host()),
             port: env_parse_or_default("QM_SERVER_PORT", default_port())?,
+            admin_addr: None,
         };
 
         let config = Config {
@@ -499,6 +509,7 @@ impl Config {
             datastore: None,
             signing_backend: None,
             ca_backend: None,
+            identity: None,
             system_billets: default_system_billets(),
         };
 
@@ -537,16 +548,16 @@ mod tests {
         Config {
             issuer: "https://qm.example.com".to_string(),
             token_ttl_secs: 300,
-            spire: SpireConfig {
+            spire: Some(SpireConfig {
                 trust_domain: "example.com".to_string(),
                 trust_bundle_path: PathBuf::from("/etc/spire/bundle.json"),
-            },
-            dynamo: DynamoConfig {
+            }),
+            dynamo: Some(DynamoConfig {
                 region: "us-east-1".to_string(),
                 policies_table: "quartermaster-policies".to_string(),
                 billets_table: "quartermaster-billets".to_string(),
                 policy_sync_interval_secs: 30,
-            },
+            }),
             signing: SigningConfig {
                 algorithm: "ES256".to_string(),
                 key_path: PathBuf::from("/etc/qm/signing.pem"),
@@ -567,11 +578,13 @@ mod tests {
             server: ServerConfig {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
+                admin_addr: None,
             },
             audit: None,
             datastore: None,
             signing_backend: None,
             ca_backend: None,
+            identity: None,
             system_billets: default_system_billets(),
         }
     }
@@ -625,7 +638,7 @@ mod tests {
     #[test]
     fn test_zero_policy_sync_interval_fails_validation() {
         let mut config = valid_config();
-        config.dynamo.policy_sync_interval_secs = 0;
+        config.dynamo.as_mut().unwrap().policy_sync_interval_secs = 0;
         let err = config.validate().unwrap_err();
         assert!(err.message.contains("policy_sync_interval_secs must be greater than 0"));
     }
@@ -633,7 +646,7 @@ mod tests {
     #[test]
     fn test_empty_region_fails_validation() {
         let mut config = valid_config();
-        config.dynamo.region = "".to_string();
+        config.dynamo.as_mut().unwrap().region = "".to_string();
         let err = config.validate().unwrap_err();
         assert!(err.message.contains("dynamo.region must not be empty"));
     }
@@ -692,11 +705,11 @@ cert_path = "/etc/qm/ca.crt"
 "#;
         let config: Config = toml::from_str(toml_content).unwrap();
         assert_eq!(config.issuer, "https://qm.example.com");
-        assert_eq!(config.spire.trust_domain, "example.com");
-        assert_eq!(config.dynamo.region, "us-east-1");
-        assert_eq!(config.dynamo.policies_table, "quartermaster-policies");
-        assert_eq!(config.dynamo.billets_table, "quartermaster-billets");
-        assert_eq!(config.dynamo.policy_sync_interval_secs, 30);
+        assert_eq!(config.spire.as_ref().unwrap().trust_domain, "example.com");
+        assert_eq!(config.dynamo.as_ref().unwrap().region, "us-east-1");
+        assert_eq!(config.dynamo.as_ref().unwrap().policies_table, "quartermaster-policies");
+        assert_eq!(config.dynamo.as_ref().unwrap().billets_table, "quartermaster-billets");
+        assert_eq!(config.dynamo.as_ref().unwrap().policy_sync_interval_secs, 30);
         assert_eq!(config.signing.algorithm, "ES256");
         assert_eq!(config.ca.ttl_secs, 300);
         assert_eq!(config.cache.backend, CacheBackend::Memory);
@@ -748,11 +761,11 @@ port = 9090
 "#;
         let config: Config = toml::from_str(toml_content).unwrap();
         assert_eq!(config.issuer, "https://qm.prod.example.com");
-        assert_eq!(config.spire.trust_domain, "prod.example.com");
-        assert_eq!(config.dynamo.region, "eu-west-1");
-        assert_eq!(config.dynamo.policies_table, "custom-policies");
-        assert_eq!(config.dynamo.billets_table, "custom-billets");
-        assert_eq!(config.dynamo.policy_sync_interval_secs, 60);
+        assert_eq!(config.spire.as_ref().unwrap().trust_domain, "prod.example.com");
+        assert_eq!(config.dynamo.as_ref().unwrap().region, "eu-west-1");
+        assert_eq!(config.dynamo.as_ref().unwrap().policies_table, "custom-policies");
+        assert_eq!(config.dynamo.as_ref().unwrap().billets_table, "custom-billets");
+        assert_eq!(config.dynamo.as_ref().unwrap().policy_sync_interval_secs, 60);
         assert_eq!(config.signing.algorithm, "ES384");
         assert_eq!(config.ca.ttl_secs, 600);
         assert_eq!(config.cache.backend, CacheBackend::Redis);
@@ -767,7 +780,7 @@ port = 9090
     #[test]
     fn test_empty_trust_domain_fails_validation() {
         let mut config = valid_config();
-        config.spire.trust_domain = "".to_string();
+        config.spire.as_mut().unwrap().trust_domain = "".to_string();
         let err = config.validate().unwrap_err();
         assert!(err.message.contains("trust_domain must not be empty"));
     }
@@ -1025,6 +1038,7 @@ cert_path = "/etc/qm/ca.crt"
             dynamodb: None,
             firestore: None,
             local: None,
+            policy_sync_interval_secs: 30,
         });
         let err = config.validate().unwrap_err();
         assert!(err.message.contains("datastore.dynamodb configuration is required"));
@@ -1042,6 +1056,7 @@ cert_path = "/etc/qm/ca.crt"
             }),
             firestore: None,
             local: None,
+            policy_sync_interval_secs: 30,
         });
         let err = config.validate().unwrap_err();
         assert!(err.message.contains("datastore.dynamodb.region must not be empty"));
@@ -1055,6 +1070,7 @@ cert_path = "/etc/qm/ca.crt"
             dynamodb: None,
             firestore: None,
             local: None,
+            policy_sync_interval_secs: 30,
         });
         let err = config.validate().unwrap_err();
         assert!(err.message.contains("datastore.firestore configuration is required"));
@@ -1071,6 +1087,7 @@ cert_path = "/etc/qm/ca.crt"
                 collection_prefix: "qm".to_string(),
             }),
             local: None,
+            policy_sync_interval_secs: 30,
         });
         let err = config.validate().unwrap_err();
         assert!(err.message.contains("datastore.firestore.project must not be empty"));
@@ -1084,6 +1101,7 @@ cert_path = "/etc/qm/ca.crt"
             dynamodb: None,
             firestore: None,
             local: None,
+            policy_sync_interval_secs: 30,
         });
         assert!(config.validate().is_ok());
     }

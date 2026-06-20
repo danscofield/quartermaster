@@ -4,7 +4,16 @@ version = "0.1.0"
 edition = "2021"
 description = "Workload identity federation broker"
 
+[[bin]]
+name = "quartermaster"
+path = "src/main.rs"
+
+[[bin]]
+name = "qm-bootstrap"
+path = "src/bin/qm_bootstrap.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -28,6 +37,7 @@ aws-sdk-kms = "1"
 aws-config = "1"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "request-id", "catch-panic"] }
+redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.12", features = ["json"] }
 url = "2"
 firestore = { version = "0.44", optional = true }

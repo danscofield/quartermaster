@@ -299,16 +299,16 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     }
 
     // Try to split into numeric part and suffix
-    let (num_str, suffix) = if s.ends_with('s') && !s.ends_with("ms") {
-        (&s[..s.len() - 1], "s")
-    } else if s.ends_with('m') {
-        (&s[..s.len() - 1], "m")
-    } else if s.ends_with('h') {
-        (&s[..s.len() - 1], "h")
-    } else if s.ends_with('d') {
-        (&s[..s.len() - 1], "d")
-    } else if s.ends_with("ms") {
-        (&s[..s.len() - 2], "ms")
+    let (num_str, suffix) = if let Some(stripped) = s.strip_suffix("ms") {
+        (stripped, "ms")
+    } else if let Some(stripped) = s.strip_suffix('s') {
+        (stripped, "s")
+    } else if let Some(stripped) = s.strip_suffix('m') {
+        (stripped, "m")
+    } else if let Some(stripped) = s.strip_suffix('h') {
+        (stripped, "h")
+    } else if let Some(stripped) = s.strip_suffix('d') {
+        (stripped, "d")
     } else {
         // Bare number — treat as seconds
         (s, "s")

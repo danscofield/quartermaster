@@ -166,12 +166,13 @@ pub trait LocalAuthorizer: Send + Sync {
 pub struct CedarAuthorizer {
     policy_set: Arc<RwLock<Option<PolicySet>>>,
     policy_sync: Arc<PolicySyncService>,
+    system_billets: Vec<String>,
 }
 
 impl CedarAuthorizer {
     /// Create a new CedarAuthorizer with the shared policy set reference and PolicySyncService.
-    pub fn new(policy_set: Arc<RwLock<Option<PolicySet>>>, policy_sync: Arc<PolicySyncService>) -> Self {
-        Self { policy_set, policy_sync }
+    pub fn new(policy_set: Arc<RwLock<Option<PolicySet>>>, policy_sync: Arc<PolicySyncService>, system_billets: Vec<String>) -> Self {
+        Self { policy_set, policy_sync, system_billets }
     }
 
     /// Build a billet tags HashMap by resolving tags from PolicySyncService for each billet name.
@@ -519,6 +520,11 @@ impl LocalAuthorizer for CedarAuthorizer {
         req: AdminAuthzRequest,
         billet_tags: &HashMap<String, Vec<String>>,
     ) -> Result<bool, CedarError> {
+        // System billets are immune to lockout on admin actions (root model)
+        if req.principals.iter().any(|p| self.system_billets.iter().any(|s| s == p)) {
+            return Ok(true);
+        }
+
         // Resolve billet tags from PolicySyncService for all relevant billets
         // (principals + resource)
         let mut all_billet_names: Vec<&str> = req.principals.iter().map(|s| s.as_str()).collect();
@@ -634,7 +640,7 @@ mod tests {
     #[tokio::test]
     async fn test_policy_set_not_initialized() {
         let policy_set = Arc::new(RwLock::new(None));
-        let authorizer = CedarAuthorizer::new(policy_set, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(policy_set, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         let req = BatchAuthzRequest {
             principal: make_workload_entity(),
@@ -650,10 +656,10 @@ mod tests {
     #[tokio::test]
     async fn test_admin_policy_set_not_initialized() {
         let policy_set = Arc::new(RwLock::new(None));
-        let authorizer = CedarAuthorizer::new(policy_set, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(policy_set, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         let req = AdminAuthzRequest {
-            principals: vec!["quartermaster-admin".to_string()],
+            principals: vec!["some-non-system-billet".to_string()],
             action: "createBillet".to_string(),
             resource: "new-billet".to_string(),
             context: make_common_context(),
@@ -668,7 +674,7 @@ mod tests {
         // An empty PolicySet should deny all requests
         let policy_set = PolicySet::new();
         let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         let req = BatchAuthzRequest {
             principal: make_workload_entity(),
@@ -687,10 +693,10 @@ mod tests {
     async fn test_admin_deny_with_empty_policy_set() {
         let policy_set = PolicySet::new();
         let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         let req = AdminAuthzRequest {
-            principals: vec!["quartermaster-admin".to_string()],
+            principals: vec!["some-non-system-billet".to_string()],
             action: "createBillet".to_string(),
             resource: "new-billet".to_string(),
             context: make_common_context(),
@@ -712,7 +718,7 @@ mod tests {
         "#;
         let policy_set = policy_str.parse::<PolicySet>().unwrap();
         let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         let req = BatchAuthzRequest {
             principal: make_workload_entity(),
@@ -741,7 +747,7 @@ mod tests {
         "#;
         let policy_set = policy_str.parse::<PolicySet>().unwrap();
         let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         let req = AdminAuthzRequest {
             principals: vec!["quartermaster-admin".to_string()],
@@ -766,7 +772,7 @@ mod tests {
         "#;
         let policy_set = policy_str.parse::<PolicySet>().unwrap();
         let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         // Include a non-admin billet and the admin billet — should allow because admin is present
         let req = AdminAuthzRequest {
@@ -795,7 +801,7 @@ mod tests {
         "#;
         let policy_set = policy_str.parse::<PolicySet>().unwrap();
         let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         let workload = WorkloadEntity {
             entity_type: PlatformType::Base,
@@ -844,7 +850,7 @@ mod tests {
         "#;
         let policy_set = policy_str.parse::<PolicySet>().unwrap();
         let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         // Build a HumanIdentity entity
         let principal_uid = make_entity_uid("HumanIdentity", "alice@example.com").unwrap();
@@ -897,7 +903,7 @@ mod tests {
         "#;
         let policy_set = policy_str.parse::<PolicySet>().unwrap();
         let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         let principal_uid = make_entity_uid(
             "AwsRoleIdentity",
@@ -958,7 +964,7 @@ mod tests {
         "#;
         let policy_set = policy_str.parse::<PolicySet>().unwrap();
         let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         let principal_uid = make_entity_uid(
             "GcpIdentity",
@@ -1008,7 +1014,7 @@ mod tests {
     async fn test_batch_entity_deny_with_empty_policy_set() {
         let policy_set = PolicySet::new();
         let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         let principal_uid = make_entity_uid("HumanIdentity", "bob@example.com").unwrap();
         let mut attrs: HashMap<String, RestrictedExpression> = HashMap::new();
@@ -1047,7 +1053,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_entity_policy_set_not_initialized() {
         let shared = Arc::new(RwLock::new(None));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         let principal_uid = make_entity_uid("HumanIdentity", "test@test.com").unwrap();
         let human_entity = Entity::new_no_attrs(principal_uid, HashSet::new());
@@ -1086,7 +1092,7 @@ mod tests {
         "#;
         let policy_set = policy_str.parse::<PolicySet>().unwrap();
         let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync());
+        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
         let principal_uid = make_entity_uid("HumanIdentity", "user@example.com").unwrap();
         let mut attrs: HashMap<String, RestrictedExpression> = HashMap::new();

@@ -1,4 +1,5 @@
 pub mod memory;
+pub mod redis;
 
 use std::time::Duration;
 

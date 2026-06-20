@@ -5,27 +5,46 @@ use tracing_subscriber::EnvFilter;
 
 use quartermaster::cedar::CedarAuthorizer;
 use quartermaster::config::Config;
-use quartermaster::config::identity::IdentityConfig;
 use quartermaster::domain::admin::authenticator::AdminAuthenticatorImpl;
 use quartermaster::domain::admin::billets::BilletCrudService;
 use quartermaster::domain::admin::policies::PolicyCrudService;
 use quartermaster::domain::audit::config::build_sinks;
 use quartermaster::domain::audit::AuditService;
 use quartermaster::domain::billet::entity_builder::EntityBuilder;
-use quartermaster::domain::billet::selector::SpireSelectorEnricher;
+use quartermaster::domain::billet::selector::{NoOpSelectorEnricher, SpireSelectorEnricher};
 use quartermaster::domain::billet::BilletResolverImpl;
+use quartermaster::config::CacheBackend;
 use quartermaster::domain::cache::memory::InMemoryCache;
+use quartermaster::domain::cache::redis::RedisCache;
 use quartermaster::domain::cert::LocalAuthority;
+use quartermaster::domain::cert::kms_authority::KmsBackedAuthority;
+use quartermaster::domain::identity::aws_sts::DefaultAwsStsValidator;
 use quartermaster::domain::identity::dispatcher::DefaultIdentityDispatcher;
 use quartermaster::domain::identity::entity::MultiSourceEntityBuilder;
+use quartermaster::domain::identity::gcp::DefaultGcpValidator;
 use quartermaster::domain::identity::implicit::ImplicitBilletMapper;
 use quartermaster::domain::identity::jwks::JwksManager;
+use quartermaster::domain::identity::oidc::DefaultOidcValidator;
 use quartermaster::domain::ratelimit::InMemoryLimiter;
 use quartermaster::domain::svid::SpireValidator;
 use quartermaster::domain::token::Es256Issuer;
 use quartermaster::server::{self, AppState};
 use quartermaster::spireapi::HttpSpireApiClient;
 use quartermaster::sync::PolicySyncService;
+
+/// Resolves the policy sync interval with cascading priority:
+/// 1. `config.datastore.policy_sync_interval_secs` (if `[datastore]` section is present)
+/// 2. `config.dynamo.policy_sync_interval_secs` (if legacy `[dynamo]` section is present)
+/// 3. Default: 30 seconds
+fn resolve_policy_sync_interval(config: &Config) -> u64 {
+    if let Some(ref ds) = config.datastore {
+        ds.policy_sync_interval_secs
+    } else if let Some(ref dynamo) = config.dynamo {
+        dynamo.policy_sync_interval_secs
+    } else {
+        30
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -96,30 +115,46 @@ async fn main() {
         quartermaster::keymanager::SigningManagerAdapter::new(Arc::clone(&signing_key_manager)),
     );
 
-    // Initialize SVID Validator from SPIRE trust bundle
-    let spire_config = config.spire.as_ref()
-        .expect("[spire] section required when SPIRE identity source is used");
-    let trust_bundle_json = std::fs::read_to_string(&spire_config.trust_bundle_path)
-        .expect("failed to read SPIRE trust bundle");
-    let trust_bundle_keys = SpireValidator::parse_jwks(&trust_bundle_json)
-        .expect("failed to parse SPIRE trust bundle JWKS");
-    let validator: Arc<dyn quartermaster::domain::svid::Validator> = Arc::new(
-        SpireValidator::new(
-            trust_bundle_keys,
-            spire_config.trust_domain.clone(),
-            config.issuer.clone(),
-        ),
-    );
+    // ─── Build Certificate Authority ──────────────────────────────────────────
+    // If [ca_backend] section is present, use the factory to build a CA key manager
+    // and construct KmsBackedAuthority; otherwise fall back to legacy [ca] section
+    // with LocalAuthority.
+    let authority: Arc<dyn quartermaster::domain::cert::Authority> =
+        if let Some(ref ca_backend_config) = config.ca_backend {
+            let ca_key_manager = quartermaster::keymanager::factory::build_key_manager(
+                ca_backend_config,
+                Arc::clone(&data_store),
+                "ca",
+            )
+            .await
+            .expect("failed to build CA key manager");
 
-    // Initialize LocalAuthority from CA PEM files
-    let ca_key_pem = std::fs::read_to_string(&config.ca.key_path)
-        .expect("failed to read CA key");
-    let ca_cert_pem = std::fs::read_to_string(&config.ca.cert_path)
-        .expect("failed to read CA certificate");
-    let authority: Arc<dyn quartermaster::domain::cert::Authority> = Arc::new(
-        LocalAuthority::new(&ca_key_pem, &ca_cert_pem, Duration::from_secs(config.ca.ttl_secs))
-            .expect("failed to initialize CA"),
-    );
+            let ca_key_pem = std::fs::read_to_string(&config.ca.key_path)
+                .expect("failed to read CA key");
+            let ca_cert_pem = std::fs::read_to_string(&config.ca.cert_path)
+                .expect("failed to read CA certificate");
+
+            Arc::new(
+                KmsBackedAuthority::new(
+                    ca_key_manager,
+                    &ca_key_pem,
+                    &ca_cert_pem,
+                    Duration::from_secs(config.ca.ttl_secs),
+                )
+                .expect("failed to initialize KMS-backed CA"),
+            )
+        } else {
+            // Legacy fallback: build LocalAuthority from [ca] section PEM files
+            let ca_key_pem = std::fs::read_to_string(&config.ca.key_path)
+                .expect("failed to read CA key");
+            let ca_cert_pem = std::fs::read_to_string(&config.ca.cert_path)
+                .expect("failed to read CA certificate");
+
+            Arc::new(
+                LocalAuthority::new(&ca_key_pem, &ca_cert_pem, Duration::from_secs(config.ca.ttl_secs))
+                    .expect("failed to initialize CA"),
+            )
+        };
 
     // Bootstrap system billets (idempotent)
     match quartermaster::domain::bootstrap::bootstrap_system_billets(data_store.as_ref()).await {
@@ -135,7 +170,7 @@ async fn main() {
     // Initialize PolicySyncService and start background sync
     let policy_sync = Arc::new(PolicySyncService::new(
         Arc::clone(&data_store),
-        config.dynamo.as_ref().map(|d| d.policy_sync_interval_secs).unwrap_or(30),
+        resolve_policy_sync_interval(&config),
         audit_service.clone(),
     ));
     let policy_sync_handle = Arc::clone(&policy_sync).start();
@@ -156,12 +191,21 @@ async fn main() {
 
     // Initialize CedarAuthorizer with PolicySyncService's policy_set_handle
     let local_authorizer: Arc<dyn quartermaster::cedar::LocalAuthorizer> = Arc::new(
-        CedarAuthorizer::new(policy_sync.policy_set_handle(), Arc::clone(&policy_sync)),
+        CedarAuthorizer::new(policy_sync.policy_set_handle(), Arc::clone(&policy_sync), config.system_billets.clone()),
     );
 
-    // Initialize InMemoryCache
-    let cache: Arc<dyn quartermaster::domain::cache::Cache> =
-        Arc::new(InMemoryCache::new());
+    // Initialize cache backend
+    let cache: Arc<dyn quartermaster::domain::cache::Cache> = match config.cache.backend {
+        CacheBackend::Redis => {
+            let redis_url = &config.redis.as_ref().unwrap().url;
+            Arc::new(
+                RedisCache::new(redis_url)
+                    .await
+                    .expect("failed to connect to Redis"),
+            )
+        }
+        CacheBackend::Memory => Arc::new(InMemoryCache::new()),
+    };
 
     // Initialize InMemoryLimiter
     let rate_limiter: Arc<dyn quartermaster::domain::ratelimit::Limiter> = Arc::new(
@@ -171,15 +215,31 @@ async fn main() {
         ),
     );
 
-    // Initialize HttpSpireApiClient
-    let spire_api_client: Arc<dyn quartermaster::spireapi::SpireApiClient> =
-        Arc::new(HttpSpireApiClient::new(
-            format!("http://localhost:8081"), // TODO: make configurable
-        ));
-
-    // Initialize SpireSelectorEnricher
+    // Initialize SelectorEnricher: use SPIRE API if configured, otherwise no-op.
     let selector_enricher: Arc<dyn quartermaster::domain::billet::selector::SelectorEnricher> =
-        Arc::new(SpireSelectorEnricher::new(spire_api_client));
+        if let Some(ref identity_config) = config.identity {
+            if let Some(ref spire_source) = identity_config.spire {
+                // New identity config: use configured server_addr or default
+                let addr = spire_source
+                    .server_addr
+                    .clone()
+                    .unwrap_or_else(|| "http://localhost:8081".to_string());
+                let spire_api_client: Arc<dyn quartermaster::spireapi::SpireApiClient> =
+                    Arc::new(HttpSpireApiClient::new(addr));
+                Arc::new(SpireSelectorEnricher::new(spire_api_client))
+            } else {
+                // Identity config exists but no SPIRE source configured
+                Arc::new(NoOpSelectorEnricher)
+            }
+        } else if config.spire.is_some() {
+            // Legacy SPIRE config present (no server_addr field), use default address
+            let spire_api_client: Arc<dyn quartermaster::spireapi::SpireApiClient> =
+                Arc::new(HttpSpireApiClient::new("http://localhost:8081".to_string()));
+            Arc::new(SpireSelectorEnricher::new(spire_api_client))
+        } else {
+            // No SPIRE configured anywhere, use no-op enricher
+            Arc::new(NoOpSelectorEnricher)
+        };
 
     // Initialize EntityBuilder
     let entity_builder = EntityBuilder::new();
@@ -224,8 +284,8 @@ async fn main() {
 
     // ─── Multi-Source Identity Initialization ──────────────────────────────────
     //
-    // Initialization flow (future-proof for full IdentityConfig):
-    // 1. Parse IdentityConfig from the app config (when available)
+    // Initialization flow:
+    // 1. Parse IdentityConfig from the app config
     // 2. If SPIRE configured: create SPIRE validator for dispatcher
     // 3. If OIDC sources configured: create JwksManager, create DefaultOidcValidator
     // 4. If AWS STS enabled: create DefaultAwsStsValidator
@@ -233,57 +293,145 @@ async fn main() {
     // 6. Create DefaultIdentityDispatcher with all configured validators
     // 7. Create MultiSourceEntityBuilder
     // 8. Create ImplicitBilletMapper from OIDC sources
-    //
-    // Currently: SPIRE is the only configured source. Other validators (OIDC, AWS STS, GCP)
-    // will be wired when IdentityConfig is added to the main Config file parsing.
 
     // Initialize IdentityDispatcher with the SPIRE validator.
-    // SPIRE initialization is conditional: if config.spire trust bundle is available, use it.
-    // Other validators (OIDC, AWS STS, GCP) will be configured via IdentityConfig.
-    let identity_dispatcher: Arc<dyn quartermaster::domain::identity::dispatcher::IdentityDispatcher> =
-        Arc::new(DefaultIdentityDispatcher::new(
+    // Priority: config.identity.spire (new) → config.spire (legacy) → None
+    let spire_validator_for_dispatcher: Option<Box<dyn quartermaster::domain::svid::Validator>> =
+        if let Some(ref identity_config) = config.identity {
+            if let Some(ref spire_source) = identity_config.spire {
+                // New identity config: use jwks_path for trust bundle and audience field
+                let trust_bundle_json = std::fs::read_to_string(&spire_source.jwks_path)
+                    .expect("failed to read SPIRE trust bundle from identity.spire.jwks_path");
+                let keys = SpireValidator::parse_jwks(&trust_bundle_json)
+                    .expect("failed to parse SPIRE trust bundle JWKS from identity.spire.jwks_path");
+                Some(Box::new(SpireValidator::new(
+                    keys,
+                    spire_source.trust_domain.clone(),
+                    spire_source.audience.clone(),
+                )))
+            } else {
+                // Identity config exists but no SPIRE source configured
+                None
+            }
+        } else if let Some(ref spire_config) = config.spire {
+            // Legacy fallback: use trust_bundle_path and config.issuer as audience
+            let trust_bundle_json = std::fs::read_to_string(&spire_config.trust_bundle_path)
+                .expect("failed to read SPIRE trust bundle for dispatcher");
+            let keys = SpireValidator::parse_jwks(&trust_bundle_json)
+                .expect("failed to parse SPIRE trust bundle JWKS for dispatcher");
             Some(Box::new(SpireValidator::new(
-                SpireValidator::parse_jwks(&trust_bundle_json)
-                    .expect("failed to parse SPIRE trust bundle JWKS for dispatcher"),
-                config.spire.as_ref().expect("[spire] required").trust_domain.clone(),
+                keys,
+                spire_config.trust_domain.clone(),
                 config.issuer.clone(),
-            ))),
-            None, // OIDC validator — configured via IdentityConfig
-            None, // AWS STS validator — configured via IdentityConfig
-            None, // GCP validator — configured via IdentityConfig
-        ));
-
-    // Initialize JwksManager for JWT-based identity sources (OIDC IdPs, GCP).
-    // Currently no OIDC/GCP sources are configured in the main Config, so we build
-    // from an empty IdentityConfig. When IdentityConfig is wired into Config parsing,
-    // this will use the actual configured sources and start background refresh tasks.
-    let jwks_manager: Option<Arc<JwksManager>> = {
-        let identity_config = IdentityConfig {
-            spire: None,
-            oidc: vec![],
-            aws_sts: None,
-            gcp: None,
+            )))
+        } else {
+            None
         };
-        // Only create JwksManager if there are JWT-based sources that need key management
-        if !identity_config.oidc.is_empty() || identity_config.gcp.as_ref().is_some_and(|g| g.enabled) {
-            let http_client = reqwest::Client::new();
-            let manager = Arc::new(JwksManager::from_config(&identity_config, http_client));
+
+    // ─── Build JwksManager for JWT-based identity sources (OIDC, GCP) ──────────
+    // Must be created BEFORE the dispatcher so we can use it as a provider for
+    // DefaultOidcValidator (and later DefaultGcpValidator).
+    let http_client = reqwest::Client::new();
+    let jwks_manager: Option<Arc<JwksManager>> = if let Some(ref identity_config) = config.identity
+    {
+        if !identity_config.oidc.is_empty()
+            || identity_config.gcp.as_ref().is_some_and(|g| g.enabled)
+        {
+            let manager = Arc::new(JwksManager::from_config(identity_config, http_client.clone()));
             manager.start_refresh_tasks();
             Some(manager)
         } else {
             None
         }
+    } else {
+        None
     };
+
+    // ─── Build OIDC Validator ──────────────────────────────────────────────────
+    let oidc_validator: Option<Box<dyn quartermaster::domain::identity::oidc::OidcValidator>> =
+        if let Some(ref identity_config) = config.identity {
+            if !identity_config.oidc.is_empty() {
+                if let Some(ref manager) = jwks_manager {
+                    Some(Box::new(DefaultOidcValidator::new(
+                        identity_config.oidc.clone(),
+                        Arc::clone(manager),
+                    )))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    // ─── Build AWS STS Validator ──────────────────────────────────────────────
+    let aws_sts_validator: Option<Box<dyn quartermaster::domain::identity::aws_sts::AwsStsValidator>> =
+        if let Some(ref identity_config) = config.identity {
+            if let Some(ref aws_sts_config) = identity_config.aws_sts {
+                if aws_sts_config.enabled {
+                    Some(Box::new(DefaultAwsStsValidator::new(
+                        aws_sts_config.clone(),
+                        http_client.clone(),
+                    )))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    // ─── Build GCP Validator ───────────────────────────────────────────────────
+    let gcp_validator: Option<Box<dyn quartermaster::domain::identity::gcp::GcpValidator>> =
+        if let Some(ref identity_config) = config.identity {
+            if let Some(ref gcp_config) = identity_config.gcp {
+                if gcp_config.enabled {
+                    if let Some(ref manager) = jwks_manager {
+                        Some(Box::new(DefaultGcpValidator::new(
+                            gcp_config.clone(),
+                            Arc::clone(manager),
+                        )))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    let identity_dispatcher: Arc<dyn quartermaster::domain::identity::dispatcher::IdentityDispatcher> =
+        Arc::new(DefaultIdentityDispatcher::new(
+            spire_validator_for_dispatcher,
+            oidc_validator, // OIDC validator — configured via IdentityConfig
+            aws_sts_validator, // AWS STS validator — configured via IdentityConfig
+            gcp_validator, // GCP validator — configured via IdentityConfig
+        ));
 
     // Initialize MultiSourceEntityBuilder
     let multi_source_entity_builder = Arc::new(MultiSourceEntityBuilder::new(EntityBuilder::new()));
 
-    // Initialize ImplicitBilletMapper (empty config until OIDC sources are configured)
-    let implicit_billet_mapper = Arc::new(ImplicitBilletMapper::from_config(&[]));
+    // Initialize ImplicitBilletMapper from OIDC sources (if configured)
+    let implicit_billet_mapper = if let Some(ref identity_config) = config.identity {
+        if !identity_config.oidc.is_empty() {
+            Arc::new(ImplicitBilletMapper::from_config(&identity_config.oidc))
+        } else {
+            Arc::new(ImplicitBilletMapper::from_config(&[]))
+        }
+    } else {
+        Arc::new(ImplicitBilletMapper::from_config(&[]))
+    };
 
     // Build AppState
     let app_state = Arc::new(AppState {
-        validator,
         resolver,
         issuer,
         authority,
@@ -306,20 +454,41 @@ async fn main() {
         jwks_manager,
     });
 
-    // Build router
-    let router = server::build_router(app_state);
+    // ─── Start HTTP Server(s) ─────────────────────────────────────────────────
+    if let Some(ref admin_addr) = config.server.admin_addr {
+        // Split mode: separate admin listener
+        let main_router = server::build_main_router(Arc::clone(&app_state), false);
+        let admin_router = server::build_admin_router(app_state);
 
-    // Start server
-    let addr = format!("{}:{}", config.server.host, config.server.port);
-    tracing::info!(addr = %addr, "starting HTTP server");
+        let main_addr = format!("{}:{}", config.server.host, config.server.port);
+        tracing::info!(main_addr = %main_addr, admin_addr = %admin_addr, "starting HTTP servers (split admin)");
 
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("failed to bind");
+        let main_listener = tokio::net::TcpListener::bind(&main_addr)
+            .await
+            .expect("failed to bind main listener");
+        let admin_listener = tokio::net::TcpListener::bind(admin_addr.as_str())
+            .await
+            .expect("failed to bind admin listener");
 
-    axum::serve(listener, router)
-        .await
-        .expect("server error");
+        tokio::select! {
+            result = axum::serve(main_listener, main_router) => {
+                result.expect("main server error");
+            }
+            result = axum::serve(admin_listener, admin_router) => {
+                result.expect("admin server error");
+            }
+        }
+    } else {
+        // Combined mode: all routes on main listener
+        let router = server::build_main_router(app_state, true);
+        let addr = format!("{}:{}", config.server.host, config.server.port);
+        tracing::info!(addr = %addr, "starting HTTP server");
+
+        let listener = tokio::net::TcpListener::bind(&addr)
+            .await
+            .expect("failed to bind");
+        axum::serve(listener, router).await.expect("server error");
+    }
 
     // Clean up background tasks (unreachable in practice since serve blocks)
     audit_service.shutdown(Duration::from_secs(5)).await;
