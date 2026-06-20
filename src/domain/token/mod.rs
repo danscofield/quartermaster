@@ -31,6 +31,11 @@ pub struct IssueRequest {
     pub spiffe_id: String,
     pub audience: String,
     pub billets: Vec<String>,
+    /// Optional identity claim to include in the JWT (for multi-source identity).
+    /// When present, the `sub` field will use this formatted subject instead of `spiffe_id`.
+    pub identity_claim: Option<serde_json::Value>,
+    /// Optional override for the `sub` claim. When set, this replaces `spiffe_id` as the subject.
+    pub subject_override: Option<String>,
 }
 
 /// IssueResponse contains the issued JWT and metadata.
@@ -48,7 +53,7 @@ pub struct IssueResponse {
 pub struct Claims {
     /// Issuer (Quartermaster issuer URL)
     pub iss: String,
-    /// Subject (workload SPIFFE ID)
+    /// Subject (workload SPIFFE ID or formatted identity subject)
     pub sub: String,
     /// Audience (single audience string)
     pub aud: String,
@@ -60,6 +65,9 @@ pub struct Claims {
     pub exp: u64,
     /// JWT ID (UUID v4)
     pub jti: String,
+    /// Identity claim — source-specific identity information
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<serde_json::Value>,
 }
 
 /// Issuer creates signed Quartermaster JWTs.
@@ -103,14 +111,18 @@ impl Issuer for Es256Issuer {
         let exp = now + self.ttl_secs;
         let jti = Uuid::new_v4().to_string();
 
+        // Use subject_override if provided; otherwise fall back to spiffe_id
+        let sub = req.subject_override.unwrap_or(req.spiffe_id);
+
         let claims = Claims {
             iss: self.issuer_url.clone(),
-            sub: req.spiffe_id,
+            sub,
             aud: req.audience,
             billets: req.billets,
             iat: now,
             exp,
             jti: jti.clone(),
+            identity: req.identity_claim,
         };
 
         let header = self.signing_manager.header().clone();
@@ -175,6 +187,8 @@ mod tests {
             spiffe_id: "spiffe://example.com/workload".to_string(),
             audience: "https://api.example.com".to_string(),
             billets: vec!["payments".to_string(), "reporting".to_string()],
+            identity_claim: None,
+            subject_override: None,
         };
 
         let resp = issuer.issue(req).await.unwrap();
@@ -226,6 +240,8 @@ mod tests {
             spiffe_id: "spiffe://example.com/workload".to_string(),
             audience: "https://api.example.com".to_string(),
             billets: vec!["payments".to_string()],
+            identity_claim: None,
+            subject_override: None,
         };
 
         let resp1 = issuer.issue(req.clone()).await.unwrap();
@@ -247,6 +263,8 @@ mod tests {
             spiffe_id: "spiffe://example.com/workload".to_string(),
             audience: "https://api.example.com".to_string(),
             billets: vec![],
+            identity_claim: None,
+            subject_override: None,
         };
 
         let resp = issuer.issue(req).await.unwrap();
@@ -266,6 +284,8 @@ mod tests {
             spiffe_id: "spiffe://example.com/workload".to_string(),
             audience: "https://api.example.com".to_string(),
             billets: vec!["admin".to_string()],
+            identity_claim: None,
+            subject_override: None,
         };
 
         let resp = issuer.issue(req).await.unwrap();
@@ -286,6 +306,8 @@ mod tests {
             spiffe_id: "spiffe://example.com/workload".to_string(),
             audience: "https://api.example.com".to_string(),
             billets: vec!["payments".to_string()],
+            identity_claim: None,
+            subject_override: None,
         };
 
         let resp = issuer.issue(req).await.unwrap();
@@ -370,6 +392,8 @@ mod tests {
                         spiffe_id: spiffe_id.clone(),
                         audience: audience.clone(),
                         billets: billets.clone(),
+                        identity_claim: None,
+                        subject_override: None,
                     };
 
                     let resp = issuer.issue(req).await.unwrap();
@@ -434,6 +458,8 @@ mod tests {
                     spiffe_id: spiffe_id.clone(),
                     audience: audience.clone(),
                     billets: billets.clone(),
+                    identity_claim: None,
+                    subject_override: None,
                 };
 
                 let resp = issuer.issue(req).await.unwrap();
@@ -541,6 +567,8 @@ mod tests {
                     spiffe_id: spiffe_id.clone(),
                     audience: audience.clone(),
                     billets: billets.clone(),
+                    identity_claim: None,
+                    subject_override: None,
                 };
 
                 let resp = issuer.issue(req).await.unwrap();

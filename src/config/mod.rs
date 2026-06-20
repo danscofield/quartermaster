@@ -1,5 +1,20 @@
+pub mod backends;
+pub mod identity;
+
 use serde::Deserialize;
 use std::path::PathBuf;
+
+use crate::domain::audit::config::AuditConfig;
+
+pub use backends::{
+    AwsKmsConfig, DataStoreBackend, DataStoreConfig, DynamoDbConfig, FirestoreConfig,
+    GcpKmsConfig, KmsDelegatedConfig, LocalStoreConfig, MemorySigningConfig, SigningBackend,
+    SigningBackendConfig,
+};
+pub use identity::{
+    AwsStsSourceConfig, GcpSourceConfig, IdentityConfig, IdentityConfigError,
+    ImplicitClaimConfig, OidcSourceConfig, SpireSourceConfig,
+};
 
 /// Top-level application configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -14,13 +29,13 @@ pub struct Config {
     /// SPIRE trust domain configuration
     pub spire: SpireConfig,
 
-    /// DynamoDB configuration
+    /// DynamoDB configuration (legacy; kept for backward compatibility during migration)
     pub dynamo: DynamoConfig,
 
-    /// JWT signing configuration
+    /// JWT signing configuration (legacy; kept for backward compatibility during migration)
     pub signing: SigningConfig,
 
-    /// Certificate authority configuration
+    /// Certificate authority configuration (legacy; kept for backward compatibility during migration)
     pub ca: CaConfig,
 
     /// Cache configuration
@@ -34,6 +49,23 @@ pub struct Config {
 
     /// HTTP server configuration
     pub server: ServerConfig,
+
+    /// Audit logging configuration (optional; defaults to stdout sink)
+    pub audit: Option<AuditConfig>,
+
+    /// New pluggable DataStore backend configuration (optional; uses legacy `dynamo` if absent)
+    pub datastore: Option<DataStoreConfig>,
+
+    /// New pluggable signing backend configuration (optional; uses legacy `signing` if absent)
+    pub signing_backend: Option<SigningBackendConfig>,
+
+    /// New pluggable CA backend configuration (optional; uses legacy `ca` if absent)
+    pub ca_backend: Option<SigningBackendConfig>,
+
+    /// System billets exempt from resource scope validation.
+    /// Defaults to ["quartermaster-admin", "quartermaster-guardrails"] if omitted.
+    #[serde(default = "default_system_billets")]
+    pub system_billets: Vec<String>,
 }
 
 /// SPIRE trust domain configuration.
@@ -169,6 +201,13 @@ fn default_requests_per_minute() -> u32 {
     10
 }
 
+fn default_system_billets() -> Vec<String> {
+    vec![
+        "quartermaster-admin".to_string(),
+        "quartermaster-guardrails".to_string(),
+    ]
+}
+
 fn default_host() -> String {
     "0.0.0.0".to_string()
 }
@@ -261,6 +300,108 @@ impl Config {
             });
         }
 
+        // Validate new backend config sections when present
+        if let Some(ref ds) = self.datastore {
+            self.validate_datastore_config(ds)?;
+        }
+
+        if let Some(ref sb) = self.signing_backend {
+            self.validate_signing_backend_config(sb, "signing_backend")?;
+        }
+
+        if let Some(ref cb) = self.ca_backend {
+            self.validate_signing_backend_config(cb, "ca_backend")?;
+        }
+
+        Ok(())
+    }
+
+    /// Validate a DataStore backend configuration section.
+    fn validate_datastore_config(&self, config: &DataStoreConfig) -> Result<(), ConfigError> {
+        match config.backend {
+            DataStoreBackend::Dynamodb => {
+                if config.dynamodb.is_none() {
+                    return Err(ConfigError {
+                        message: "datastore.dynamodb configuration is required when backend is 'dynamodb'".to_string(),
+                    });
+                }
+                let dynamo = config.dynamodb.as_ref().unwrap();
+                if dynamo.region.trim().is_empty() {
+                    return Err(ConfigError {
+                        message: "datastore.dynamodb.region must not be empty".to_string(),
+                    });
+                }
+            }
+            DataStoreBackend::Firestore => {
+                if config.firestore.is_none() {
+                    return Err(ConfigError {
+                        message: "datastore.firestore configuration is required when backend is 'firestore'".to_string(),
+                    });
+                }
+                let fs = config.firestore.as_ref().unwrap();
+                if fs.project.trim().is_empty() {
+                    return Err(ConfigError {
+                        message: "datastore.firestore.project must not be empty".to_string(),
+                    });
+                }
+            }
+            DataStoreBackend::Local => {
+                // Local backend has sensible defaults; no required sub-config
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a signing backend configuration section.
+    fn validate_signing_backend_config(&self, config: &SigningBackendConfig, section: &str) -> Result<(), ConfigError> {
+        match config.backend {
+            SigningBackend::Memory => {
+                if config.memory.is_none() {
+                    return Err(ConfigError {
+                        message: format!("{}.memory configuration is required when backend is 'memory'", section),
+                    });
+                }
+                let mem = config.memory.as_ref().unwrap();
+                if mem.key_path.trim().is_empty() {
+                    return Err(ConfigError {
+                        message: format!("{}.memory.key_path must not be empty", section),
+                    });
+                }
+            }
+            SigningBackend::KmsDelegated => {
+                if config.kms_delegated.is_none() {
+                    return Err(ConfigError {
+                        message: format!("{}.kms_delegated configuration is required when backend is 'kms_delegated'", section),
+                    });
+                }
+                let kms = config.kms_delegated.as_ref().unwrap();
+                // Must have at least one KMS provider configured
+                if kms.aws_kms.is_none() && kms.gcp_kms.is_none() {
+                    return Err(ConfigError {
+                        message: format!("{}.kms_delegated must have either aws_kms or gcp_kms configured", section),
+                    });
+                }
+                if let Some(ref aws) = kms.aws_kms {
+                    if aws.key_arn.trim().is_empty() {
+                        return Err(ConfigError {
+                            message: format!("{}.kms_delegated.aws_kms.key_arn must not be empty", section),
+                        });
+                    }
+                    if aws.region.trim().is_empty() {
+                        return Err(ConfigError {
+                            message: format!("{}.kms_delegated.aws_kms.region must not be empty", section),
+                        });
+                    }
+                }
+                if let Some(ref gcp) = kms.gcp_kms {
+                    if gcp.key_name.trim().is_empty() {
+                        return Err(ConfigError {
+                            message: format!("{}.kms_delegated.gcp_kms.key_name must not be empty", section),
+                        });
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -350,6 +491,11 @@ impl Config {
             redis,
             rate,
             server,
+            audit: None,
+            datastore: None,
+            signing_backend: None,
+            ca_backend: None,
+            system_billets: default_system_billets(),
         };
 
         config.validate()?;
@@ -418,6 +564,11 @@ mod tests {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
             },
+            audit: None,
+            datastore: None,
+            signing_backend: None,
+            ca_backend: None,
+            system_billets: default_system_billets(),
         }
     }
 
@@ -625,5 +776,540 @@ port = 9090
             config.signing.algorithm = alg.to_string();
             assert!(config.validate().is_ok(), "algorithm {} should be valid", alg);
         }
+    }
+
+    // --- New backend config tests ---
+
+    #[test]
+    fn test_toml_deserialization_with_datastore_section() {
+        let toml_content = r#"
+issuer = "https://qm.example.com"
+
+[spire]
+trust_domain = "example.com"
+trust_bundle_path = "/etc/spire/bundle.json"
+
+[dynamo]
+region = "us-east-1"
+
+[signing]
+key_path = "/etc/qm/signing.pem"
+
+[ca]
+key_path = "/etc/qm/ca.key"
+cert_path = "/etc/qm/ca.crt"
+
+[cache]
+
+[rate]
+
+[server]
+
+[datastore]
+backend = "dynamodb"
+
+[datastore.dynamodb]
+region = "us-west-2"
+billets_table = "my-billets"
+policies_table = "my-policies"
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        let ds = config.datastore.as_ref().unwrap();
+        assert_eq!(ds.backend, DataStoreBackend::Dynamodb);
+        let dynamo = ds.dynamodb.as_ref().unwrap();
+        assert_eq!(dynamo.region, "us-west-2");
+        assert_eq!(dynamo.billets_table, "my-billets");
+        assert_eq!(dynamo.policies_table, "my-policies");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_toml_deserialization_with_signing_backend_section() {
+        let toml_content = r#"
+issuer = "https://qm.example.com"
+
+[spire]
+trust_domain = "example.com"
+trust_bundle_path = "/etc/spire/bundle.json"
+
+[dynamo]
+region = "us-east-1"
+
+[signing]
+key_path = "/etc/qm/signing.pem"
+
+[ca]
+key_path = "/etc/qm/ca.key"
+cert_path = "/etc/qm/ca.crt"
+
+[cache]
+
+[rate]
+
+[server]
+
+[signing_backend]
+backend = "memory"
+
+[signing_backend.memory]
+key_path = "/etc/qm/new-signing.pem"
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        let sb = config.signing_backend.as_ref().unwrap();
+        assert_eq!(sb.backend, SigningBackend::Memory);
+        let mem = sb.memory.as_ref().unwrap();
+        assert_eq!(mem.key_path, "/etc/qm/new-signing.pem");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_toml_deserialization_with_ca_backend_section() {
+        let toml_content = r#"
+issuer = "https://qm.example.com"
+
+[spire]
+trust_domain = "example.com"
+trust_bundle_path = "/etc/spire/bundle.json"
+
+[dynamo]
+region = "us-east-1"
+
+[signing]
+key_path = "/etc/qm/signing.pem"
+
+[ca]
+key_path = "/etc/qm/ca.key"
+cert_path = "/etc/qm/ca.crt"
+
+[cache]
+
+[rate]
+
+[server]
+
+[ca_backend]
+backend = "kms_delegated"
+
+[ca_backend.kms_delegated]
+rotation_interval = "12h"
+key_overlap = "48h"
+ephemeral_algorithm = "ES384"
+
+[ca_backend.kms_delegated.aws_kms]
+key_arn = "arn:aws:kms:us-east-1:123456789:key/ca-key"
+region = "us-east-1"
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        let cb = config.ca_backend.as_ref().unwrap();
+        assert_eq!(cb.backend, SigningBackend::KmsDelegated);
+        let kms = cb.kms_delegated.as_ref().unwrap();
+        assert_eq!(kms.rotation_interval, "12h");
+        assert_eq!(kms.key_overlap, "48h");
+        assert_eq!(kms.ephemeral_algorithm, "ES384");
+        let aws = kms.aws_kms.as_ref().unwrap();
+        assert_eq!(aws.key_arn, "arn:aws:kms:us-east-1:123456789:key/ca-key");
+        assert_eq!(aws.region, "us-east-1");
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_toml_deserialization_with_all_new_backend_sections() {
+        let toml_content = r#"
+issuer = "https://qm.example.com"
+
+[spire]
+trust_domain = "example.com"
+trust_bundle_path = "/etc/spire/bundle.json"
+
+[dynamo]
+region = "us-east-1"
+
+[signing]
+key_path = "/etc/qm/signing.pem"
+
+[ca]
+key_path = "/etc/qm/ca.key"
+cert_path = "/etc/qm/ca.crt"
+
+[cache]
+
+[rate]
+
+[server]
+
+[datastore]
+backend = "firestore"
+
+[datastore.firestore]
+project = "my-gcp-project"
+collection_prefix = "qm-prod"
+
+[signing_backend]
+backend = "kms_delegated"
+
+[signing_backend.kms_delegated]
+
+[signing_backend.kms_delegated.gcp_kms]
+key_name = "projects/my-project/locations/global/keyRings/ring/cryptoKeys/signing"
+
+[ca_backend]
+backend = "memory"
+
+[ca_backend.memory]
+key_path = "/etc/qm/ca-new.pem"
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+
+        let ds = config.datastore.as_ref().unwrap();
+        assert_eq!(ds.backend, DataStoreBackend::Firestore);
+        let fs = ds.firestore.as_ref().unwrap();
+        assert_eq!(fs.project, "my-gcp-project");
+        assert_eq!(fs.collection_prefix, "qm-prod");
+
+        let sb = config.signing_backend.as_ref().unwrap();
+        assert_eq!(sb.backend, SigningBackend::KmsDelegated);
+        let kms = sb.kms_delegated.as_ref().unwrap();
+        assert_eq!(kms.rotation_interval, "6h"); // default
+        let gcp = kms.gcp_kms.as_ref().unwrap();
+        assert_eq!(gcp.key_name, "projects/my-project/locations/global/keyRings/ring/cryptoKeys/signing");
+
+        let cb = config.ca_backend.as_ref().unwrap();
+        assert_eq!(cb.backend, SigningBackend::Memory);
+        let mem = cb.memory.as_ref().unwrap();
+        assert_eq!(mem.key_path, "/etc/qm/ca-new.pem");
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_toml_deserialization_without_new_sections_is_backward_compatible() {
+        let toml_content = r#"
+issuer = "https://qm.example.com"
+
+[spire]
+trust_domain = "example.com"
+trust_bundle_path = "/etc/spire/bundle.json"
+
+[dynamo]
+region = "us-east-1"
+
+[signing]
+key_path = "/etc/qm/signing.pem"
+
+[ca]
+key_path = "/etc/qm/ca.key"
+cert_path = "/etc/qm/ca.crt"
+
+[cache]
+
+[rate]
+
+[server]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(config.datastore.is_none());
+        assert!(config.signing_backend.is_none());
+        assert!(config.ca_backend.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_datastore_dynamodb_without_config_fails_validation() {
+        let mut config = valid_config();
+        config.datastore = Some(DataStoreConfig {
+            backend: DataStoreBackend::Dynamodb,
+            dynamodb: None,
+            firestore: None,
+            local: None,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.message.contains("datastore.dynamodb configuration is required"));
+    }
+
+    #[test]
+    fn test_datastore_dynamodb_empty_region_fails_validation() {
+        let mut config = valid_config();
+        config.datastore = Some(DataStoreConfig {
+            backend: DataStoreBackend::Dynamodb,
+            dynamodb: Some(DynamoDbConfig {
+                region: "".to_string(),
+                billets_table: "billets".to_string(),
+                policies_table: "policies".to_string(),
+            }),
+            firestore: None,
+            local: None,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.message.contains("datastore.dynamodb.region must not be empty"));
+    }
+
+    #[test]
+    fn test_datastore_firestore_without_config_fails_validation() {
+        let mut config = valid_config();
+        config.datastore = Some(DataStoreConfig {
+            backend: DataStoreBackend::Firestore,
+            dynamodb: None,
+            firestore: None,
+            local: None,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.message.contains("datastore.firestore configuration is required"));
+    }
+
+    #[test]
+    fn test_datastore_firestore_empty_project_fails_validation() {
+        let mut config = valid_config();
+        config.datastore = Some(DataStoreConfig {
+            backend: DataStoreBackend::Firestore,
+            dynamodb: None,
+            firestore: Some(FirestoreConfig {
+                project: "  ".to_string(),
+                collection_prefix: "qm".to_string(),
+            }),
+            local: None,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.message.contains("datastore.firestore.project must not be empty"));
+    }
+
+    #[test]
+    fn test_datastore_local_passes_without_sub_config() {
+        let mut config = valid_config();
+        config.datastore = Some(DataStoreConfig {
+            backend: DataStoreBackend::Local,
+            dynamodb: None,
+            firestore: None,
+            local: None,
+        });
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_signing_backend_memory_without_config_fails_validation() {
+        let mut config = valid_config();
+        config.signing_backend = Some(SigningBackendConfig {
+            backend: SigningBackend::Memory,
+            memory: None,
+            kms_delegated: None,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.message.contains("signing_backend.memory configuration is required"));
+    }
+
+    #[test]
+    fn test_signing_backend_memory_empty_key_path_fails_validation() {
+        let mut config = valid_config();
+        config.signing_backend = Some(SigningBackendConfig {
+            backend: SigningBackend::Memory,
+            memory: Some(MemorySigningConfig {
+                key_path: "  ".to_string(),
+            }),
+            kms_delegated: None,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.message.contains("signing_backend.memory.key_path must not be empty"));
+    }
+
+    #[test]
+    fn test_signing_backend_kms_without_config_fails_validation() {
+        let mut config = valid_config();
+        config.signing_backend = Some(SigningBackendConfig {
+            backend: SigningBackend::KmsDelegated,
+            memory: None,
+            kms_delegated: None,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.message.contains("signing_backend.kms_delegated configuration is required"));
+    }
+
+    #[test]
+    fn test_signing_backend_kms_without_provider_fails_validation() {
+        let mut config = valid_config();
+        config.signing_backend = Some(SigningBackendConfig {
+            backend: SigningBackend::KmsDelegated,
+            memory: None,
+            kms_delegated: Some(KmsDelegatedConfig {
+                rotation_interval: "6h".to_string(),
+                key_overlap: "24h".to_string(),
+                ephemeral_algorithm: "ES256".to_string(),
+                aws_kms: None,
+                gcp_kms: None,
+            }),
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.message.contains("must have either aws_kms or gcp_kms configured"));
+    }
+
+    #[test]
+    fn test_signing_backend_kms_empty_aws_key_arn_fails_validation() {
+        let mut config = valid_config();
+        config.signing_backend = Some(SigningBackendConfig {
+            backend: SigningBackend::KmsDelegated,
+            memory: None,
+            kms_delegated: Some(KmsDelegatedConfig {
+                rotation_interval: "6h".to_string(),
+                key_overlap: "24h".to_string(),
+                ephemeral_algorithm: "ES256".to_string(),
+                aws_kms: Some(AwsKmsConfig {
+                    key_arn: "".to_string(),
+                    region: "us-east-1".to_string(),
+                }),
+                gcp_kms: None,
+            }),
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.message.contains("aws_kms.key_arn must not be empty"));
+    }
+
+    #[test]
+    fn test_signing_backend_kms_empty_gcp_key_name_fails_validation() {
+        let mut config = valid_config();
+        config.signing_backend = Some(SigningBackendConfig {
+            backend: SigningBackend::KmsDelegated,
+            memory: None,
+            kms_delegated: Some(KmsDelegatedConfig {
+                rotation_interval: "6h".to_string(),
+                key_overlap: "24h".to_string(),
+                ephemeral_algorithm: "ES256".to_string(),
+                aws_kms: None,
+                gcp_kms: Some(GcpKmsConfig {
+                    key_name: "  ".to_string(),
+                }),
+            }),
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.message.contains("gcp_kms.key_name must not be empty"));
+    }
+
+    #[test]
+    fn test_ca_backend_memory_without_config_fails_validation() {
+        let mut config = valid_config();
+        config.ca_backend = Some(SigningBackendConfig {
+            backend: SigningBackend::Memory,
+            memory: None,
+            kms_delegated: None,
+        });
+        let err = config.validate().unwrap_err();
+        assert!(err.message.contains("ca_backend.memory configuration is required"));
+    }
+
+    #[test]
+    fn test_ca_backend_kms_with_valid_aws_passes() {
+        let mut config = valid_config();
+        config.ca_backend = Some(SigningBackendConfig {
+            backend: SigningBackend::KmsDelegated,
+            memory: None,
+            kms_delegated: Some(KmsDelegatedConfig {
+                rotation_interval: "6h".to_string(),
+                key_overlap: "24h".to_string(),
+                ephemeral_algorithm: "ES256".to_string(),
+                aws_kms: Some(AwsKmsConfig {
+                    key_arn: "arn:aws:kms:us-east-1:123456789:key/abc-123".to_string(),
+                    region: "us-east-1".to_string(),
+                }),
+                gcp_kms: None,
+            }),
+        });
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_toml_deserialization_with_datastore_local_default() {
+        let toml_content = r#"
+issuer = "https://qm.example.com"
+
+[spire]
+trust_domain = "example.com"
+trust_bundle_path = "/etc/spire/bundle.json"
+
+[dynamo]
+region = "us-east-1"
+
+[signing]
+key_path = "/etc/qm/signing.pem"
+
+[ca]
+key_path = "/etc/qm/ca.key"
+cert_path = "/etc/qm/ca.crt"
+
+[cache]
+
+[rate]
+
+[server]
+
+[datastore]
+backend = "local"
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        let ds = config.datastore.as_ref().unwrap();
+        assert_eq!(ds.backend, DataStoreBackend::Local);
+        assert!(ds.local.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_system_billets_defaults_when_omitted_from_toml() {
+        let toml_content = r#"
+issuer = "https://qm.example.com"
+
+[spire]
+trust_domain = "example.com"
+trust_bundle_path = "/etc/spire/bundle.json"
+
+[dynamo]
+region = "us-east-1"
+
+[signing]
+key_path = "/etc/qm/signing.pem"
+
+[ca]
+key_path = "/etc/qm/ca.key"
+cert_path = "/etc/qm/ca.crt"
+
+[cache]
+
+[rate]
+
+[server]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(
+            config.system_billets,
+            vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_system_billets_custom_list_overrides_defaults() {
+        let toml_content = r#"
+issuer = "https://qm.example.com"
+system_billets = ["my-admin", "my-guardrails", "extra-system"]
+
+[spire]
+trust_domain = "example.com"
+trust_bundle_path = "/etc/spire/bundle.json"
+
+[dynamo]
+region = "us-east-1"
+
+[signing]
+key_path = "/etc/qm/signing.pem"
+
+[ca]
+key_path = "/etc/qm/ca.key"
+cert_path = "/etc/qm/ca.crt"
+
+[cache]
+
+[rate]
+
+[server]
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert_eq!(
+            config.system_billets,
+            vec!["my-admin".to_string(), "my-guardrails".to_string(), "extra-system".to_string()]
+        );
     }
 }

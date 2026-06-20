@@ -1,4 +1,5 @@
 pub mod config;
+pub mod datastore;
 pub mod server;
 pub mod handler;
 pub mod domain;
@@ -7,4 +8,5 @@ pub mod dynamo;
 pub mod sync;
 pub mod spireapi;
 pub mod signing;
+pub mod keymanager;
 pub mod oidc;

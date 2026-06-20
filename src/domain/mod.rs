@@ -6,6 +6,8 @@ pub mod cache;
 pub mod ratelimit;
 pub mod audit;
 pub mod admin;
+pub mod identity;
+pub mod bootstrap;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};

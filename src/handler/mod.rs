@@ -7,4 +7,3 @@ pub mod ca;
 pub mod health;
 pub mod billets;
 pub mod admin_billets;
-pub mod admin_policies;

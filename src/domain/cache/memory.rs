@@ -65,9 +65,10 @@ impl InMemoryCache {
         cache
     }
 
-    /// Constructs the cache key from spiffe_id and audience.
-    fn cache_key(spiffe_id: &str, audience: &str) -> String {
-        format!("{}:{}", spiffe_id, audience)
+    /// Constructs the cache key from subject and audience.
+    /// The subject is the formatted `sub` claim for the authenticated identity.
+    fn cache_key(subject: &str, audience: &str) -> String {
+        format!("{}:{}", subject, audience)
     }
 }
 
@@ -79,8 +80,8 @@ impl Default for InMemoryCache {
 
 #[async_trait::async_trait]
 impl Cache for InMemoryCache {
-    async fn get(&self, spiffe_id: &str, audience: &str) -> Result<Option<CacheEntry>, CacheError> {
-        let key = Self::cache_key(spiffe_id, audience);
+    async fn get(&self, subject: &str, audience: &str) -> Result<Option<CacheEntry>, CacheError> {
+        let key = Self::cache_key(subject, audience);
 
         // First try with a read lock for the common case (entry exists and is valid)
         {
@@ -117,12 +118,12 @@ impl Cache for InMemoryCache {
 
     async fn set(
         &self,
-        spiffe_id: &str,
+        subject: &str,
         audience: &str,
         billets: Vec<String>,
         ttl: Duration,
     ) -> Result<(), CacheError> {
-        let key = Self::cache_key(spiffe_id, audience);
+        let key = Self::cache_key(subject, audience);
         let entry = InternalEntry {
             billets,
             stored_at: Utc::now(),
@@ -134,8 +135,8 @@ impl Cache for InMemoryCache {
         Ok(())
     }
 
-    async fn delete(&self, spiffe_id: &str, audience: &str) -> Result<(), CacheError> {
-        let key = Self::cache_key(spiffe_id, audience);
+    async fn delete(&self, subject: &str, audience: &str) -> Result<(), CacheError> {
+        let key = Self::cache_key(subject, audience);
         let mut map = self.store.write().await;
         map.remove(&key);
         Ok(())

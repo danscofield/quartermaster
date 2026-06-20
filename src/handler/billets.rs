@@ -1,5 +1,6 @@
 // GET /billets/{name} (data-plane billet metadata)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -51,6 +52,7 @@ pub async fn get_billet(
             environment: String::new(),
             region: String::new(),
             request_time: chrono::Utc::now().to_rfc3339(),
+            source_type: String::new(),
             source_cloud: String::new(),
             selectors: vec![],
         },
@@ -58,7 +60,7 @@ pub async fn get_billet(
 
     let authorized = state
         .local_authorizer
-        .is_authorized_admin(authz_request)
+        .is_authorized_admin(authz_request, &HashMap::new())
         .await
         .map_err(|e| DomainError::service_unavailable(e.to_string()))?;
 
@@ -68,19 +70,19 @@ pub async fn get_billet(
         ));
     }
 
-    // 4. Retrieve billet metadata from DynamoDB
-    let metadata = state
-        .dynamo_client
-        .get_billet_metadata(&name)
+    // 4. Retrieve billet metadata from DataStore
+    let billet_record = state
+        .data_store
+        .get_billet(&name)
         .await
         .map_err(|e| DomainError::service_unavailable(e.to_string()))?
         .ok_or_else(|| DomainError::not_found(format!("billet '{}' not found", name)))?;
 
     Ok(Json(BilletMetadataResponse {
-        name: metadata.name,
-        description: metadata.description,
-        associated_aws_roles: metadata.associated_aws_roles,
-        associated_gcp_sas: metadata.associated_gcp_sas,
+        name: billet_record.name,
+        description: billet_record.description,
+        associated_aws_roles: billet_record.associated_aws_roles,
+        associated_gcp_sas: billet_record.associated_gcp_sas,
     }))
 }
 

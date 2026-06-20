@@ -3,6 +3,7 @@
 //! Verifies Quartermaster-issued JWTs and evaluates Cedar policies
 //! to authorize admin actions on the control plane.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
@@ -176,6 +177,7 @@ impl Authenticator for AdminAuthenticatorImpl {
                 environment: String::new(),
                 region: String::new(),
                 request_time: chrono::Utc::now().to_rfc3339(),
+                source_type: String::new(),
                 source_cloud: String::new(),
                 selectors: vec![],
             },
@@ -183,7 +185,7 @@ impl Authenticator for AdminAuthenticatorImpl {
 
         let authorized = self
             .local_authorizer
-            .is_authorized_admin(authz_request)
+            .is_authorized_admin(authz_request, &HashMap::new())
             .await
             .map_err(|e| {
                 AdminAuthError::InvalidToken(format!("authorization evaluation failed: {e}"))
@@ -244,6 +246,8 @@ mod tests {
             spiffe_id: spiffe_id.to_string(),
             audience: issuer_url.to_string(),
             billets,
+            identity_claim: None,
+            subject_override: None,
         };
         issuer.issue(req).await.unwrap().access_token
     }
@@ -316,6 +320,7 @@ mod tests {
             iat: now - 600,
             exp: now - 300, // expired 5 minutes ago
             jti: "test-jti".to_string(),
+            identity: None,
         };
 
         let header = signing_manager.header().clone();
@@ -370,7 +375,7 @@ mod tests {
         // Authorizer denies the request
         mock_authorizer
             .expect_is_authorized_admin()
-            .returning(|_| Ok(false));
+            .returning(|_, _| Ok(false));
 
         let token = issue_test_token(
             signing_manager.clone(),
@@ -401,7 +406,7 @@ mod tests {
         // Authorizer allows the request
         mock_authorizer
             .expect_is_authorized_admin()
-            .returning(|_| Ok(true));
+            .returning(|_, _| Ok(true));
 
         let spiffe_id = "spiffe://example.com/admin-workload";
         let token = issue_test_token(
@@ -433,10 +438,10 @@ mod tests {
         // Verify the action and resource are passed correctly
         mock_authorizer
             .expect_is_authorized_admin()
-            .withf(|req: &AdminAuthzRequest| {
+            .withf(|req: &AdminAuthzRequest, _: &HashMap<String, Vec<String>>| {
                 req.action == "deleteBillet" && req.resource == "my-billet"
             })
-            .returning(|_| Ok(true));
+            .returning(|_, _| Ok(true));
 
         let token = issue_test_token(
             signing_manager.clone(),
@@ -469,8 +474,8 @@ mod tests {
 
         mock_authorizer
             .expect_is_authorized_admin()
-            .withf(move |req: &AdminAuthzRequest| req.principals == expected_billets_clone)
-            .returning(|_| Ok(true));
+            .withf(move |req: &AdminAuthzRequest, _: &HashMap<String, Vec<String>>| req.principals == expected_billets_clone)
+            .returning(|_, _| Ok(true));
 
         let token = issue_test_token(
             signing_manager.clone(),

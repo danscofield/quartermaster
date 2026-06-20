@@ -4,21 +4,26 @@ pub mod middleware;
 
 use std::sync::Arc;
 
-use axum::routing::{get, post, put};
+use axum::routing::{get, post};
 use axum::Router;
 
 use crate::cedar::LocalAuthorizer;
+use crate::datastore::DataStore;
 use crate::domain::admin::authenticator::Authenticator;
 use crate::domain::admin::billets::BilletCrudService;
 use crate::domain::admin::policies::PolicyCrudService;
-use crate::domain::audit::AuditLogger;
+use crate::domain::audit::AuditService;
 use crate::domain::billet::Resolver;
 use crate::domain::cache::Cache;
 use crate::domain::cert::Authority;
+use crate::domain::identity::dispatcher::IdentityDispatcher;
+use crate::domain::identity::entity::MultiSourceEntityBuilder;
+use crate::domain::identity::implicit::ImplicitBilletMapper;
+use crate::domain::identity::jwks::JwksManager;
 use crate::domain::ratelimit::Limiter;
 use crate::domain::svid::Validator;
 use crate::domain::token::Issuer;
-use crate::dynamo::DynamoClient;
+use crate::keymanager::KeyManager;
 use crate::signing::SigningManager;
 use crate::sync::PolicySyncService;
 
@@ -33,16 +38,27 @@ pub struct AppState {
     pub authority: Arc<dyn Authority>,
     pub cache: Arc<dyn Cache>,
     pub rate_limiter: Arc<dyn Limiter>,
-    pub audit_logger: Arc<dyn AuditLogger>,
+    pub audit_service: AuditService,
     pub signing_manager: Arc<dyn SigningManager>,
+    pub signing_key_manager: Arc<dyn KeyManager>,
     pub policy_sync: Arc<PolicySyncService>,
-    pub dynamo_client: Arc<dyn DynamoClient>,
+    pub data_store: Arc<dyn DataStore>,
     pub local_authorizer: Arc<dyn LocalAuthorizer>,
     pub admin_authenticator: Arc<dyn Authenticator>,
     pub billet_crud_service: Arc<BilletCrudService>,
     pub policy_crud_service: Arc<PolicyCrudService>,
     pub issuer_url: String,
     pub algorithm: String,
+    /// Multi-source identity dispatcher (routes by subject_token_type).
+    pub identity_dispatcher: Arc<dyn IdentityDispatcher>,
+    /// Entity builder for constructing Cedar principal entities from any identity source.
+    pub entity_builder: Arc<MultiSourceEntityBuilder>,
+    /// Implicit billet mapper for OIDC sources.
+    pub implicit_billet_mapper: Arc<ImplicitBilletMapper>,
+    /// JWKS manager for all JWT-based identity sources (OIDC IdPs, GCP).
+    /// `None` when no JWT-based sources (OIDC, GCP) are configured.
+    /// Used for health checks and monitoring of key freshness.
+    pub jwks_manager: Option<Arc<JwksManager>>,
 }
 
 /// Builds the axum Router with all routes and middleware applied.
@@ -67,13 +83,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/admin/billets/{name}",
             get(handler::admin_billets::get_billet)
+                .put(handler::admin_billets::update_billet)
                 .delete(handler::admin_billets::delete_billet),
         )
-        .route("/admin/policies", post(handler::admin_policies::create_policy))
         .route(
-            "/admin/policies/{id}",
-            put(handler::admin_policies::update_policy)
-                .delete(handler::admin_policies::delete_policy),
+            "/admin/billets/{name}/policies",
+            post(handler::admin_billets::create_policy)
+                .get(handler::admin_billets::list_policies),
+        )
+        .route(
+            "/admin/billets/{name}/policies/{id}",
+            get(handler::admin_billets::get_policy)
+                .put(handler::admin_billets::update_policy)
+                .delete(handler::admin_billets::delete_policy),
         )
         .with_state(state);
 

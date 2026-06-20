@@ -3,6 +3,7 @@
 pub mod entity_builder;
 pub mod selector;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -104,7 +105,9 @@ impl BilletResolverImpl {
 #[async_trait::async_trait]
 impl Resolver for BilletResolverImpl {
     async fn resolve(&self, input: ResolverInput) -> Result<Resolution, BilletError> {
-        // Step 1: Check cache for (spiffe_id, audience)
+        // Step 1: Check cache using subject (spiffe_id for SPIRE) + audience
+        // For SPIRE identities, the subject IS the SPIFFE ID. For other identity
+        // sources, the caller should pass the formatted subject string.
         match self.cache.get(&input.spiffe_id, &input.audience).await {
             Ok(Some(entry)) => {
                 // Cache hit — return immediately
@@ -183,6 +186,7 @@ impl Resolver for BilletResolverImpl {
                 environment: input.environment.clone(),
                 region: input.region.clone(),
                 request_time: input.request_time.to_rfc3339(),
+                source_type: "spire".to_string(),
                 source_cloud: input.source_cloud.clone(),
                 selectors: combined_selectors,
             },
@@ -190,7 +194,7 @@ impl Resolver for BilletResolverImpl {
 
         let decisions = self
             .authorizer
-            .batch_is_authorized(batch_req)
+            .batch_is_authorized(batch_req, &HashMap::new())
             .await
             .map_err(|e| BilletError::InternalError(format!("authorization failed: {e}")))?;
 
@@ -206,7 +210,7 @@ impl Resolver for BilletResolverImpl {
             return Err(BilletError::NoBilletsResolved);
         }
 
-        // Step 9: Store result in cache
+        // Step 9: Store result in cache (keyed by subject + audience)
         if let Err(CacheError::BackendError(msg)) = self
             .cache
             .set(
@@ -239,10 +243,15 @@ impl Resolver for BilletResolverImpl {
 mod tests {
     use super::*;
     use crate::cedar::{AuthzDecision, CedarError, MockLocalAuthorizer};
+    use crate::domain::audit::service::AuditService;
     use crate::domain::cache::memory::InMemoryCache;
     use crate::domain::cache::CacheEntry;
-    use crate::dynamo::MockDynamoClient;
+    use crate::datastore::MockDataStore;
     use crate::domain::billet::selector::MockSelectorEnricher;
+
+    fn test_audit_service() -> AuditService {
+        AuditService::new(vec![], 100)
+    }
 
     fn make_input() -> ResolverInput {
         ResolverInput {
@@ -259,11 +268,12 @@ mod tests {
 
     /// Helper: creates a PolicySyncService that has been initialized (sync_once called).
     async fn make_initialized_policy_sync() -> Arc<PolicySyncService> {
-        use crate::dynamo::PolicyRecord;
+        use crate::datastore::{BilletRecord, PolicyRecord};
 
-        let mut mock_dynamo = MockDynamoClient::new();
-        mock_dynamo.expect_list_policies().returning(|| {
+        let mut mock_dynamo = MockDataStore::new();
+        mock_dynamo.expect_list_all_policies().returning(|| {
             Ok(vec![PolicyRecord {
+                billet_name: "payments".to_string(),
                 policy_id: "p1".to_string(),
                 statement: r#"permit(principal, action == Quartermaster::Action::"assumeBillet", resource == Quartermaster::Billet::"payments");"#.to_string(),
                 description: "test".to_string(),
@@ -271,8 +281,19 @@ mod tests {
                 updated_at: "2024-01-01T00:00:00Z".to_string(),
             }])
         });
+        mock_dynamo.expect_list_billets().returning(|| {
+            Ok(vec![BilletRecord {
+                name: "payments".to_string(),
+                description: "payments billet".to_string(),
+                associated_aws_roles: vec![],
+                associated_gcp_sas: vec![],
+                tags: vec![],
+                created_at: "2024-01-01T00:00:00Z".to_string(),
+                updated_at: "2024-01-01T00:00:00Z".to_string(),
+            }])
+        });
 
-        let service = Arc::new(PolicySyncService::new(Arc::new(mock_dynamo), 300));
+        let service = Arc::new(PolicySyncService::new(Arc::new(mock_dynamo), 300, test_audit_service()));
         // Start and wait for initial sync
         let handle = Arc::clone(&service).start();
         // Poll for initialization to complete
@@ -289,9 +310,10 @@ mod tests {
 
     /// Helper: creates a PolicySyncService that is NOT initialized.
     fn make_uninitialized_policy_sync() -> Arc<PolicySyncService> {
-        let mut mock_dynamo = MockDynamoClient::new();
-        mock_dynamo.expect_list_policies().never();
-        Arc::new(PolicySyncService::new(Arc::new(mock_dynamo), 300))
+        let mut mock_dynamo = MockDataStore::new();
+        mock_dynamo.expect_list_all_policies().never();
+        mock_dynamo.expect_list_billets().never();
+        Arc::new(PolicySyncService::new(Arc::new(mock_dynamo), 300, test_audit_service()))
     }
 
     #[tokio::test]
@@ -343,7 +365,7 @@ mod tests {
         let mut mock_authorizer = MockLocalAuthorizer::new();
         mock_authorizer
             .expect_batch_is_authorized()
-            .returning(|req| {
+            .returning(|req, _billet_tags| {
                 Ok(req
                     .resources
                     .iter()
@@ -392,7 +414,7 @@ mod tests {
         let mut mock_authorizer = MockLocalAuthorizer::new();
         mock_authorizer
             .expect_batch_is_authorized()
-            .returning(|req| {
+            .returning(|req, _billet_tags| {
                 Ok(req
                     .resources
                     .iter()
@@ -451,7 +473,7 @@ mod tests {
         impl Cache for FailingCache {
             async fn get(
                 &self,
-                _spiffe_id: &str,
+                _subject: &str,
                 _audience: &str,
             ) -> Result<Option<CacheEntry>, CacheError> {
                 Err(CacheError::BackendError("connection refused".to_string()))
@@ -459,7 +481,7 @@ mod tests {
 
             async fn set(
                 &self,
-                _spiffe_id: &str,
+                _subject: &str,
                 _audience: &str,
                 _billets: Vec<String>,
                 _ttl: Duration,
@@ -469,7 +491,7 @@ mod tests {
 
             async fn delete(
                 &self,
-                _spiffe_id: &str,
+                _subject: &str,
                 _audience: &str,
             ) -> Result<(), CacheError> {
                 Err(CacheError::BackendError("connection refused".to_string()))
@@ -487,7 +509,7 @@ mod tests {
         let mut mock_authorizer = MockLocalAuthorizer::new();
         mock_authorizer
             .expect_batch_is_authorized()
-            .returning(|req| {
+            .returning(|req, _billet_tags| {
                 Ok(req
                     .resources
                     .iter()
@@ -528,7 +550,7 @@ mod tests {
         let mut mock_authorizer = MockLocalAuthorizer::new();
         mock_authorizer
             .expect_batch_is_authorized()
-            .returning(|req| {
+            .returning(|req, _billet_tags| {
                 // Verify selectors still include the input ones
                 assert!(req.context.selectors.contains(&"k8s:ns:finance".to_string()));
                 Ok(req
@@ -569,7 +591,7 @@ mod tests {
         let mut mock_authorizer = MockLocalAuthorizer::new();
         mock_authorizer
             .expect_batch_is_authorized()
-            .returning(|_| Err(CedarError::EvaluationFailed("boom".to_string())));
+            .returning(|_, _billet_tags| Err(CedarError::EvaluationFailed("boom".to_string())));
 
         let resolver = BilletResolverImpl::new(
             Arc::new(mock_enricher),
@@ -586,13 +608,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_mixed_decisions_filters_allow_only() {
-        use crate::dynamo::PolicyRecord;
+        use crate::datastore::{BilletRecord, PolicyRecord};
 
         // Create a policy sync with multiple known billets (one policy per billet)
-        let mut mock_dynamo = MockDynamoClient::new();
-        mock_dynamo.expect_list_policies().returning(|| {
+        let mut mock_dynamo = MockDataStore::new();
+        mock_dynamo.expect_list_all_policies().returning(|| {
             Ok(vec![
                 PolicyRecord {
+                    billet_name: "payments".to_string(),
                     policy_id: "p1".to_string(),
                     statement: r#"permit(principal, action == Quartermaster::Action::"assumeBillet", resource == Quartermaster::Billet::"payments");"#.to_string(),
                     description: "test".to_string(),
@@ -600,6 +623,7 @@ mod tests {
                     updated_at: "2024-01-01T00:00:00Z".to_string(),
                 },
                 PolicyRecord {
+                    billet_name: "analytics".to_string(),
                     policy_id: "p2".to_string(),
                     statement: r#"permit(principal, action == Quartermaster::Action::"assumeBillet", resource == Quartermaster::Billet::"analytics");"#.to_string(),
                     description: "test".to_string(),
@@ -607,6 +631,7 @@ mod tests {
                     updated_at: "2024-01-01T00:00:00Z".to_string(),
                 },
                 PolicyRecord {
+                    billet_name: "reporting".to_string(),
                     policy_id: "p3".to_string(),
                     statement: r#"permit(principal, action == Quartermaster::Action::"assumeBillet", resource == Quartermaster::Billet::"reporting");"#.to_string(),
                     description: "test".to_string(),
@@ -615,8 +640,39 @@ mod tests {
                 },
             ])
         });
+        mock_dynamo.expect_list_billets().returning(|| {
+            Ok(vec![
+                BilletRecord {
+                    name: "payments".to_string(),
+                    description: "payments billet".to_string(),
+                    associated_aws_roles: vec![],
+                    associated_gcp_sas: vec![],
+                    tags: vec![],
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    updated_at: "2024-01-01T00:00:00Z".to_string(),
+                },
+                BilletRecord {
+                    name: "analytics".to_string(),
+                    description: "analytics billet".to_string(),
+                    associated_aws_roles: vec![],
+                    associated_gcp_sas: vec![],
+                    tags: vec![],
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    updated_at: "2024-01-01T00:00:00Z".to_string(),
+                },
+                BilletRecord {
+                    name: "reporting".to_string(),
+                    description: "reporting billet".to_string(),
+                    associated_aws_roles: vec![],
+                    associated_gcp_sas: vec![],
+                    tags: vec![],
+                    created_at: "2024-01-01T00:00:00Z".to_string(),
+                    updated_at: "2024-01-01T00:00:00Z".to_string(),
+                },
+            ])
+        });
 
-        let policy_sync = Arc::new(PolicySyncService::new(Arc::new(mock_dynamo), 300));
+        let policy_sync = Arc::new(PolicySyncService::new(Arc::new(mock_dynamo), 300, test_audit_service()));
         let handle = Arc::clone(&policy_sync).start();
         // Wait for initialization to complete
         for _ in 0..20 {
@@ -638,7 +694,7 @@ mod tests {
         let mut mock_authorizer = MockLocalAuthorizer::new();
         mock_authorizer
             .expect_batch_is_authorized()
-            .returning(|req| {
+            .returning(|req, _billet_tags| {
                 Ok(req
                     .resources
                     .iter()

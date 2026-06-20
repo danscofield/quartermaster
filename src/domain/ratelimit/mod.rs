@@ -22,24 +22,31 @@ impl std::fmt::Display for RateLimitError {
 
 impl std::error::Error for RateLimitError {}
 
-/// Limiter enforces per-identity request rate limits.
+/// Limiter enforces per-subject request rate limits.
+///
+/// The subject is the source-specific identifier (e.g., the SPIFFE ID for SPIRE,
+/// `human:<email>` for OIDC, `aws:<account_id>:<role_name>` for AWS STS, etc.).
 #[async_trait::async_trait]
 pub trait Limiter: Send + Sync {
-    /// Allow checks if a request from the given SPIFFE ID is within rate limits.
+    /// Checks if a request from the given subject is within rate limits.
     /// Returns true if allowed, false if rate limited.
-    async fn allow(&self, spiffe_id: &str) -> Result<bool, RateLimitError>;
+    ///
+    /// The `subject` parameter is the formatted subject string for the identity source
+    /// (for SPIRE this is the SPIFFE ID, for other sources it follows the format defined
+    /// by `format_subject`).
+    async fn allow(&self, subject: &str) -> Result<bool, RateLimitError>;
 }
 
 /// An in-memory rate limiter using a sliding window approach.
 ///
-/// For each SPIFFE ID, tracks timestamps of requests within the configured window
+/// For each subject, tracks timestamps of requests within the configured window
 /// (default 60 seconds). A request is allowed if the number of requests in the
 /// current window is below the configured limit.
 ///
 /// Stale entries are cleaned up periodically via a background task.
 #[derive(Clone)]
 pub struct InMemoryLimiter {
-    /// Per-identity request timestamps within the sliding window.
+    /// Per-subject request timestamps within the sliding window.
     windows: Arc<RwLock<HashMap<String, VecDeque<Instant>>>>,
     /// Maximum number of requests allowed per window.
     requests_per_minute: u32,
@@ -58,7 +65,7 @@ impl InMemoryLimiter {
     }
 
     /// Creates a new InMemoryLimiter and spawns a background task that periodically
-    /// cleans up stale entries (identities with no recent requests).
+    /// cleans up stale entries (subjects with no recent requests).
     ///
     /// The cleanup task runs every `cleanup_interval` and removes entries that have
     /// no timestamps within the current window.
@@ -75,7 +82,7 @@ impl InMemoryLimiter {
                 let cutoff = now - window_duration;
                 let mut map = windows.write().await;
 
-                // For each identity, remove timestamps older than the window
+                // For each subject, remove timestamps older than the window
                 map.retain(|_, timestamps| {
                     // Remove expired timestamps from the front
                     while let Some(&front) = timestamps.front() {
@@ -97,12 +104,12 @@ impl InMemoryLimiter {
 
 #[async_trait::async_trait]
 impl Limiter for InMemoryLimiter {
-    async fn allow(&self, spiffe_id: &str) -> Result<bool, RateLimitError> {
+    async fn allow(&self, subject: &str) -> Result<bool, RateLimitError> {
         let now = Instant::now();
         let cutoff = now - self.window_duration;
 
         let mut map = self.windows.write().await;
-        let timestamps = map.entry(spiffe_id.to_string()).or_insert_with(VecDeque::new);
+        let timestamps = map.entry(subject.to_string()).or_insert_with(VecDeque::new);
 
         // Remove timestamps older than the sliding window
         while let Some(&front) = timestamps.front() {
@@ -153,15 +160,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_different_identities_are_independent() {
+    async fn test_different_subjects_are_independent() {
         let limiter = InMemoryLimiter::new(2);
 
-        // Fill up identity A
+        // Fill up subject A
         assert!(limiter.allow("spiffe://example/a").await.unwrap());
         assert!(limiter.allow("spiffe://example/a").await.unwrap());
         assert!(!limiter.allow("spiffe://example/a").await.unwrap());
 
-        // Identity B should still be allowed
+        // Subject B should still be allowed
         assert!(limiter.allow("spiffe://example/b").await.unwrap());
         assert!(limiter.allow("spiffe://example/b").await.unwrap());
         assert!(!limiter.allow("spiffe://example/b").await.unwrap());
