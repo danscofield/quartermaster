@@ -36,6 +36,12 @@ pub struct SpireSourceConfig {
 
     /// Expected audience in SVIDs
     pub audience: String,
+
+    /// Optional path to PEM-encoded CA certificates for X.509-SVID chain validation.
+    /// These are the root/intermediate CAs that issued the X.509-SVIDs.
+    /// Distinct from `jwks_path`, which provides JWT signing keys for JWT-SVID verification.
+    /// When absent, mTLS identity source is disabled.
+    pub x509_bundle_path: Option<String>,
 }
 
 /// Configuration for a single OIDC identity provider source.
@@ -667,6 +673,7 @@ billet_prefix = "okta-group"
                 jwks_path: "/run/spire/bundle.json".to_string(),
                 server_addr: None,
                 audience: "qm.example.com".to_string(),
+                x509_bundle_path: None,
             }),
             oidc: vec![],
             aws_sts: None,
@@ -997,6 +1004,7 @@ billet_prefix = "okta-group"
                 jwks_path: "/run/spire/bundle.json".to_string(),
                 server_addr: None,
                 audience: "qm.example.com".to_string(),
+                x509_bundle_path: None,
             }),
             oidc: vec![source1, source2],
             aws_sts: Some(AwsStsSourceConfig {

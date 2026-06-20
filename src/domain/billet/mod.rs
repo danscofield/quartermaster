@@ -3,7 +3,7 @@
 pub mod entity_builder;
 pub mod selector;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -236,6 +236,45 @@ impl Resolver for BilletResolverImpl {
             billets,
             cache_hit: false,
         })
+    }
+}
+
+/// Result of a scoping operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeResult {
+    /// The scoped billets (intersection of requested and entitled).
+    pub billets: Vec<String>,
+}
+
+/// Error when requested billets are not a subset of entitled billets.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScopeDenied {
+    /// Billets that were requested but not in the entitled set.
+    pub denied: Vec<String>,
+}
+
+/// Scopes an entitled billet set by intersecting with a requested set.
+///
+/// Returns Ok(intersection) if all requested billets are entitled.
+/// Returns Err(denied list) if any requested billet is not entitled.
+pub fn scope_billets(
+    entitled: &[String],
+    requested: &[String],
+) -> Result<ScopeResult, ScopeDenied> {
+    let entitled_set: HashSet<&str> = entitled.iter().map(|s| s.as_str()).collect();
+    let denied: Vec<String> = requested
+        .iter()
+        .filter(|r| !entitled_set.contains(r.as_str()))
+        .cloned()
+        .collect();
+
+    if denied.is_empty() {
+        // All requested are entitled — return requested (preserving order)
+        Ok(ScopeResult {
+            billets: requested.to_vec(),
+        })
+    } else {
+        Err(ScopeDenied { denied })
     }
 }
 
@@ -727,5 +766,62 @@ mod tests {
         assert!(!result.billets.contains(&"analytics".to_string()));
         assert!(result.billets.contains(&"payments".to_string()));
         assert!(result.billets.contains(&"reporting".to_string()));
+    }
+
+    // --- scope_billets unit tests ---
+
+    #[test]
+    fn test_scope_billets_subset_returns_ok() {
+        let entitled = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let requested = vec!["a".to_string(), "c".to_string()];
+        let result = scope_billets(&entitled, &requested);
+        assert_eq!(
+            result,
+            Ok(ScopeResult {
+                billets: vec!["a".to_string(), "c".to_string()]
+            })
+        );
+    }
+
+    #[test]
+    fn test_scope_billets_not_subset_returns_denied() {
+        let entitled = vec!["a".to_string(), "b".to_string()];
+        let requested = vec!["a".to_string(), "x".to_string()];
+        let result = scope_billets(&entitled, &requested);
+        assert_eq!(
+            result,
+            Err(ScopeDenied {
+                denied: vec!["x".to_string()]
+            })
+        );
+    }
+
+    #[test]
+    fn test_scope_billets_empty_requested_returns_ok_empty() {
+        let entitled = vec!["a".to_string(), "b".to_string()];
+        let requested: Vec<String> = vec![];
+        let result = scope_billets(&entitled, &requested);
+        assert_eq!(result, Ok(ScopeResult { billets: vec![] }));
+    }
+
+    #[test]
+    fn test_scope_billets_preserves_requested_order() {
+        let entitled = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let requested = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        let result = scope_billets(&entitled, &requested).unwrap();
+        assert_eq!(result.billets, vec!["c", "a", "b"]);
+    }
+
+    #[test]
+    fn test_scope_billets_all_denied() {
+        let entitled = vec!["a".to_string()];
+        let requested = vec!["x".to_string(), "y".to_string()];
+        let result = scope_billets(&entitled, &requested);
+        assert_eq!(
+            result,
+            Err(ScopeDenied {
+                denied: vec!["x".to_string(), "y".to_string()]
+            })
+        );
     }
 }

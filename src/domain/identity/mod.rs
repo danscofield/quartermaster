@@ -5,6 +5,7 @@ pub mod entity;
 pub mod gcp;
 pub mod implicit;
 pub mod jwks;
+pub mod mtls;
 pub mod oidc;
 pub mod subject;
 
@@ -28,6 +29,17 @@ pub struct SpireIdentity {
     pub environment: String,
     pub region: String,
     pub audience: Vec<String>,
+}
+
+/// Indicates whether a `SpireIdentity` was authenticated via JWT-SVID (token exchange)
+/// or mTLS client certificate (X.509-SVID). Used to differentiate the audit `source_type`:
+/// `"spire"` for JWT-SVIDs and `"mtls-spiffe"` for mTLS-derived identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpireAuthSource {
+    /// Identity was authenticated via a SPIRE JWT-SVID token.
+    JwtSvid,
+    /// Identity was authenticated via an mTLS client certificate (X.509-SVID).
+    MtlsCert,
 }
 
 #[derive(Debug, Clone)]

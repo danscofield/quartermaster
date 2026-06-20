@@ -10,7 +10,7 @@ use cedar_policy::{
 use crate::cedar::WorkloadEntity;
 use crate::domain::billet::entity_builder::{EntityBuilder, EntityBuilderInput};
 use crate::domain::identity::{
-    AuthenticatedIdentity, AwsStsIdentity, GcpIdentity, OidcIdentity,
+    AuthenticatedIdentity, AwsStsIdentity, GcpIdentity, OidcIdentity, SpireAuthSource,
 };
 
 #[cfg(test)]
@@ -198,12 +198,27 @@ pub fn principal_entity_uid(principal: &CedarPrincipal) -> Result<EntityUid, Ent
 }
 
 /// Returns the `source_type` string for a given identity.
+///
+/// For `Spire` identities, this defaults to `"spire"` (JWT-SVID).
+/// Use [`source_type_for_spire_identity`] when the `SpireAuthSource` is known
+/// to distinguish between JWT-SVID (`"spire"`) and mTLS (`"mtls-spiffe"`).
 pub fn source_type_for_identity(identity: &AuthenticatedIdentity) -> &'static str {
     match identity {
         AuthenticatedIdentity::Spire(_) => "spire",
         AuthenticatedIdentity::Oidc(_) => "oidc",
         AuthenticatedIdentity::AwsSts(_) => "aws-sts",
         AuthenticatedIdentity::Gcp(_) => "gcp",
+    }
+}
+
+/// Returns the `source_type` string for a SPIRE identity based on the authentication source.
+///
+/// - `SpireAuthSource::JwtSvid` → `"spire"` (standard JWT-SVID token exchange)
+/// - `SpireAuthSource::MtlsCert` → `"mtls-spiffe"` (mTLS client certificate)
+pub fn source_type_for_spire_identity(source: SpireAuthSource) -> &'static str {
+    match source {
+        SpireAuthSource::JwtSvid => "spire",
+        SpireAuthSource::MtlsCert => "mtls-spiffe",
     }
 }
 
@@ -557,6 +572,22 @@ mod tests {
         assert_eq!(
             source_type_for_identity(&AuthenticatedIdentity::Gcp(make_gcp_identity())),
             "gcp"
+        );
+    }
+
+    #[test]
+    fn test_source_type_for_spire_identity_jwt() {
+        assert_eq!(
+            source_type_for_spire_identity(SpireAuthSource::JwtSvid),
+            "spire"
+        );
+    }
+
+    #[test]
+    fn test_source_type_for_spire_identity_mtls() {
+        assert_eq!(
+            source_type_for_spire_identity(SpireAuthSource::MtlsCert),
+            "mtls-spiffe"
         );
     }
 

@@ -1,6 +1,7 @@
 // HTTP server setup (axum), route registration
 
 pub mod middleware;
+pub mod tls;
 
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use crate::domain::identity::dispatcher::IdentityDispatcher;
 use crate::domain::identity::entity::MultiSourceEntityBuilder;
 use crate::domain::identity::implicit::ImplicitBilletMapper;
 use crate::domain::identity::jwks::JwksManager;
+use crate::domain::identity::mtls::MtlsValidator;
 use crate::domain::ratelimit::Limiter;
 use crate::domain::token::Issuer;
 use crate::keymanager::KeyManager;
@@ -57,6 +59,12 @@ pub struct AppState {
     /// `None` when no JWT-based sources (OIDC, GCP) are configured.
     /// Used for health checks and monitoring of key freshness.
     pub jwks_manager: Option<Arc<JwksManager>>,
+    /// mTLS client certificate validator.
+    /// `None` when:
+    /// - `[identity.spire]` is not configured, OR
+    /// - `[identity.spire].x509_bundle_path` is absent, OR
+    /// - `[server.tls]` is absent
+    pub mtls_validator: Option<Arc<MtlsValidator>>,
 }
 
 /// Builds the data-plane router, conditionally including admin routes.
@@ -74,7 +82,8 @@ pub fn build_main_router(state: Arc<AppState>, include_admin: bool) -> Router {
         .route("/jwks.json", get(handler::jwks::jwks))
         .route("/ca/chain.pem", get(handler::ca::ca_chain))
         .route("/healthz", get(handler::health::healthz))
-        .route("/billets/{name}", get(handler::billets::get_billet));
+        .route("/billets/{name}", get(handler::billets::get_billet))
+        .route("/billets/me", post(handler::billets_discovery::billet_discovery));
 
     if include_admin {
         app = app

@@ -39,7 +39,13 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "request-id", "catch-panic"] }
 redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
 reqwest = { version = "0.12", features = ["json"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
 url = "2"
+x509-parser = "0.16"
 firestore = { version = "0.44", optional = true }
 futures = { version = "0.3", optional = true }
 

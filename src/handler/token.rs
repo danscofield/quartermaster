@@ -4,21 +4,22 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::response::IntoResponse;
-use axum::Form;
+use axum::{Extension, Form};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::audit::IdentityAuditDetails;
 use crate::domain::audit::schema::{AuditActor, AuditEnvelope, TokenExchangeDetails};
-use crate::domain::billet::{BilletError, ResolverInput};
+use crate::domain::billet::{BilletError, ResolverInput, scope_billets};
 use crate::domain::cert::CertIssueRequest;
 use crate::domain::identity::claims::build_identity_claim;
-use crate::domain::identity::entity::source_type_for_identity;
+use crate::domain::identity::entity::{source_type_for_identity, source_type_for_spire_identity};
 use crate::domain::identity::implicit::assemble_token_billets;
 use crate::domain::identity::subject::format_subject;
-use crate::domain::identity::{AuthenticatedIdentity, IdentityError};
+use crate::domain::identity::{AuthenticatedIdentity, IdentityError, SpireAuthSource};
 use crate::domain::token::IssueRequest;
 use crate::domain::{DomainError, ErrorCode};
 use crate::server::AppState;
+use crate::server::middleware::ClientCertificate;
 
 /// Form body for the token exchange request (application/x-www-form-urlencoded).
 #[derive(Debug, Deserialize)]
@@ -28,6 +29,8 @@ pub struct TokenExchangeForm {
     pub subject_token_type: Option<String>,
     pub audience: Option<String>,
     pub csr: Option<String>,
+    /// Optional comma-separated list of billet names to scope the token to.
+    pub billets: Option<String>,
 }
 
 /// JSON response for a successful token exchange.
@@ -45,8 +48,14 @@ pub struct TokenExchangeResponse {
 ///
 /// Orchestrates: validate identity → rate limit → resolve billets → implicit mapping
 /// → token assembly → issue JWT → (optional) issue cert → audit log → return response.
+///
+/// Identity resolution precedence:
+/// 1. If `subject_token` is present → use token dispatch (existing path)
+/// 2. If absent, try mTLS identity from client certificate extension
+/// 3. If neither available → return 400
 pub async fn token_exchange(
     State(state): State<Arc<AppState>>,
+    Extension(client_cert): Extension<ClientCertificate>,
     headers: axum::http::HeaderMap,
     Form(form): Form<TokenExchangeForm>,
 ) -> Result<impl IntoResponse, DomainError> {
@@ -64,47 +73,65 @@ pub async fn token_exchange(
         ));
     }
 
-    let subject_token = form.subject_token.ok_or_else(|| {
-        DomainError::invalid_request("subject_token is required")
-    })?;
-
-    let subject_token_type = form.subject_token_type.ok_or_else(|| {
-        DomainError::invalid_request("subject_token_type is required")
-    })?;
-
     let audience = form.audience.ok_or_else(|| {
         DomainError::invalid_request("audience is required")
     })?;
 
-    // 2. Dispatch to IdentityDispatcher to validate the subject token
-    let identity = state
-        .identity_dispatcher
-        .validate(&subject_token, &subject_token_type)
-        .await
-        .map_err(|e| {
-            // Log failed validation attempt
-            let actor = AuditActor {
-                subject: String::new(),
-                source_type: source_type_from_token_type(&subject_token_type),
-            };
-            let details = TokenExchangeDetails {
-                cedar_billets: vec![],
-                implicit_billets: vec![],
-                audience: audience.clone(),
-                jti: None,
-                identity_details: IdentityAuditDetails::Spire {
-                    spiffe_id: String::new(),
-                },
-            };
-            state.audit_service.emit(
-                AuditEnvelope::token_exchange_failure(&request_id, actor, &e.to_string(), details)
-            );
-            identity_error_to_domain_error(e)
+    // 2. Unified identity resolution with precedence logic:
+    //    - If subject_token present → use token dispatch (existing path)
+    //    - If absent, try mTLS identity from client certificate
+    //    - If neither available → return 400
+    let (identity, auth_source) = if let Some(subject_token) = form.subject_token {
+        // Explicit token always takes precedence
+        let subject_token_type = form.subject_token_type.ok_or_else(|| {
+            DomainError::invalid_request("subject_token_type is required when subject_token is provided")
         })?;
+
+        let id = state
+            .identity_dispatcher
+            .validate(&subject_token, &subject_token_type)
+            .await
+            .map_err(|e| {
+                // Log failed validation attempt
+                let actor = AuditActor {
+                    subject: String::new(),
+                    source_type: source_type_from_token_type(&subject_token_type),
+                };
+                let details = TokenExchangeDetails {
+                    cedar_billets: vec![],
+                    implicit_billets: vec![],
+                    audience: audience.clone(),
+                    jti: None,
+                    identity_details: IdentityAuditDetails::Spire {
+                        spiffe_id: String::new(),
+                    },
+                };
+                state.audit_service.emit(
+                    AuditEnvelope::token_exchange_failure(&request_id, actor, &e.to_string(), details)
+                );
+                identity_error_to_domain_error(e)
+            })?;
+
+        // Determine auth source based on the identity type
+        let source = match &id {
+            AuthenticatedIdentity::Spire(_) => SpireAuthSource::JwtSvid,
+            _ => SpireAuthSource::JwtSvid, // Non-SPIRE identities don't use SpireAuthSource, but we track it for uniformity
+        };
+        (id, source)
+    } else if let Some(mtls_identity) = extract_mtls_identity(&client_cert, &state) {
+        (AuthenticatedIdentity::Spire(mtls_identity), SpireAuthSource::MtlsCert)
+    } else {
+        return Err(DomainError::invalid_request(
+            "subject_token is required when no client certificate is presented",
+        ));
+    };
 
     // 3. Format subject and determine source type
     let subject = format_subject(&identity);
-    let source_type = source_type_for_identity(&identity).to_string();
+    let source_type = match &identity {
+        AuthenticatedIdentity::Spire(_) => source_type_for_spire_identity(auth_source).to_string(),
+        _ => source_type_for_identity(&identity).to_string(),
+    };
 
     // 4. Rate limit check (keyed by formatted subject)
     let allowed = state.rate_limiter.allow(&subject).await.map_err(|e| {
@@ -181,6 +208,25 @@ pub async fn token_exchange(
         reserved_prefixes,
     );
 
+    // 7.5 Apply billet scoping if requested
+    let scoped_billets = if let Some(ref billets_param) = form.billets {
+        match parse_requested_billets(billets_param) {
+            Some(requested) => {
+                match scope_billets(&final_billets, &requested) {
+                    Ok(result) => result.billets,
+                    Err(denied) => {
+                        return Err(DomainError::insufficient_scope(
+                            format!("requested billets not entitled: {}", denied.denied.join(", "))
+                        ));
+                    }
+                }
+            }
+            None => final_billets.clone(), // empty/whitespace billets param = no scoping
+        }
+    } else {
+        final_billets.clone()
+    };
+
     // 8. Build the identity claim for the JWT
     let identity_claim = build_identity_claim(&identity);
 
@@ -188,7 +234,7 @@ pub async fn token_exchange(
     let issue_req = IssueRequest {
         spiffe_id: subject.clone(),
         audience: audience.clone(),
-        billets: final_billets.clone(),
+        billets: scoped_billets.clone(),
         identity_claim: Some(identity_claim),
         subject_override: Some(subject.clone()),
     };
@@ -208,7 +254,7 @@ pub async fn token_exchange(
         let cert_req = CertIssueRequest {
             csr_der,
             spiffe_id: subject.clone(),
-            billets: final_billets.clone(),
+            billets: scoped_billets.clone(),
         };
 
         let cert_resp = state.authority.issue(cert_req).await.map_err(|e| {
@@ -249,6 +295,41 @@ pub async fn token_exchange(
 }
 
 // ─── Helper Functions ────────────────────────────────────────────────────────
+
+/// Attempts to extract a SPIRE identity from the client certificate presented during TLS.
+///
+/// Returns `Some(SpireIdentity)` if:
+/// - The `MtlsValidator` is configured in AppState
+/// - A client certificate was presented (DER bytes present)
+/// - The certificate validates against the trust bundle and contains a valid SPIFFE URI SAN
+///
+/// Returns `None` if any of those conditions are not met (silent fallback).
+fn extract_mtls_identity(
+    client_cert: &ClientCertificate,
+    state: &AppState,
+) -> Option<crate::domain::identity::SpireIdentity> {
+    let cert_der = client_cert.0.as_ref()?;
+    let validator = state.mtls_validator.as_ref()?;
+    validator.validate(cert_der)
+}
+
+/// Parses a comma-separated billets string into a deduplicated Vec of trimmed billet names.
+/// Returns None for empty/whitespace-only input.
+/// Deduplication preserves first-occurrence order.
+fn parse_requested_billets(raw: &str) -> Option<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let billets: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| seen.insert(s.clone()))
+        .collect();
+    if billets.is_empty() {
+        None
+    } else {
+        Some(billets)
+    }
+}
 
 /// Maps an IdentityError to the appropriate DomainError HTTP response.
 fn identity_error_to_domain_error(e: IdentityError) -> DomainError {

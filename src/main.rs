@@ -430,6 +430,50 @@ async fn main() {
         Arc::new(ImplicitBilletMapper::from_config(&[]))
     };
 
+    // ─── Build MtlsValidator ──────────────────────────────────────────────────
+    // Constructed only when BOTH [server.tls] is configured AND
+    // [identity.spire].x509_bundle_path is present. Panics on startup if the
+    // configured x509_bundle_path file is missing or contains malformed PEM.
+    let mtls_validator: Option<Arc<quartermaster::domain::identity::mtls::MtlsValidator>> =
+        if config.server.tls.is_some() {
+            if let Some(ref identity_config) = config.identity {
+                if let Some(ref spire_source) = identity_config.spire {
+                    if let Some(ref x509_bundle_path) = spire_source.x509_bundle_path {
+                        let ca_pem = std::fs::read(x509_bundle_path).unwrap_or_else(|e| {
+                            panic!(
+                                "failed to read x509_bundle_path '{}': {}",
+                                x509_bundle_path, e
+                            )
+                        });
+                        let validator = quartermaster::domain::identity::mtls::MtlsValidator::from_pem(
+                            &ca_pem,
+                            &spire_source.trust_domain,
+                        )
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "failed to parse x509_bundle_path '{}': {}",
+                                x509_bundle_path, e
+                            )
+                        });
+                        tracing::info!(
+                            path = %x509_bundle_path,
+                            trust_domain = %spire_source.trust_domain,
+                            "mTLS validator initialized from x509_bundle_path"
+                        );
+                        Some(Arc::new(validator))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
     // Build AppState
     let app_state = Arc::new(AppState {
         resolver,
@@ -452,9 +496,23 @@ async fn main() {
         entity_builder: multi_source_entity_builder,
         implicit_billet_mapper,
         jwks_manager,
+        mtls_validator,
     });
 
     // ─── Start HTTP Server(s) ─────────────────────────────────────────────────
+    // Build TLS config if [server.tls] is configured. Panics on startup if
+    // cert/key files are missing or malformed (fail-fast for misconfiguration).
+    let tls_server_config = config.server.tls.as_ref().map(|tls_config| {
+        let rustls_config = server::tls::build_tls_config(tls_config)
+            .unwrap_or_else(|e| panic!("failed to build TLS config: {}", e));
+        tracing::info!(
+            cert_path = %tls_config.cert_path,
+            key_path = %tls_config.key_path,
+            "TLS configuration loaded"
+        );
+        Arc::new(rustls_config)
+    });
+
     if let Some(ref admin_addr) = config.server.admin_addr {
         // Split mode: separate admin listener
         let main_router = server::build_main_router(Arc::clone(&app_state), false);
@@ -470,24 +528,44 @@ async fn main() {
             .await
             .expect("failed to bind admin listener");
 
-        tokio::select! {
-            result = axum::serve(main_listener, main_router) => {
-                result.expect("main server error");
+        if let Some(tls_config) = tls_server_config {
+            // TLS mode: main listener uses TLS with peer cert extraction
+            tracing::info!("main listener using TLS");
+            tokio::select! {
+                _ = server::tls::serve_tls(main_listener, tls_config, main_router) => {}
+                result = axum::serve(admin_listener, admin_router) => {
+                    result.expect("admin server error");
+                }
             }
-            result = axum::serve(admin_listener, admin_router) => {
-                result.expect("admin server error");
+        } else {
+            // Plain HTTP mode (existing behavior)
+            tokio::select! {
+                result = axum::serve(main_listener, main_router) => {
+                    result.expect("main server error");
+                }
+                result = axum::serve(admin_listener, admin_router) => {
+                    result.expect("admin server error");
+                }
             }
         }
     } else {
         // Combined mode: all routes on main listener
         let router = server::build_main_router(app_state, true);
         let addr = format!("{}:{}", config.server.host, config.server.port);
-        tracing::info!(addr = %addr, "starting HTTP server");
 
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .expect("failed to bind");
-        axum::serve(listener, router).await.expect("server error");
+
+        if let Some(tls_config) = tls_server_config {
+            // TLS mode with peer cert extraction
+            tracing::info!(addr = %addr, "starting HTTPS server");
+            server::tls::serve_tls(listener, tls_config, router).await;
+        } else {
+            // Plain HTTP mode (existing behavior)
+            tracing::info!(addr = %addr, "starting HTTP server");
+            axum::serve(listener, router).await.expect("server error");
+        }
     }
 
     // Clean up background tasks (unreachable in practice since serve blocks)

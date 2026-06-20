@@ -161,6 +161,15 @@ pub struct RateConfig {
     pub requests_per_minute: u32,
 }
 
+/// TLS configuration for the server listener.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsConfig {
+    /// Path to the PEM-encoded server certificate.
+    pub cert_path: String,
+    /// Path to the PEM-encoded server private key.
+    pub key_path: String,
+}
+
 /// HTTP server configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
@@ -175,6 +184,9 @@ pub struct ServerConfig {
     /// Optional separate bind address for admin routes (e.g., "127.0.0.1:9090").
     /// When set, admin endpoints are served on this address instead of the main server.
     pub admin_addr: Option<String>,
+
+    /// Optional TLS configuration. If absent, the server listens on plain HTTP.
+    pub tls: Option<TlsConfig>,
 }
 
 // --- Default value functions ---
@@ -492,6 +504,7 @@ impl Config {
             host: env_or_default("QM_SERVER_HOST", default_host()),
             port: env_parse_or_default("QM_SERVER_PORT", default_port())?,
             admin_addr: None,
+            tls: None,
         };
 
         let config = Config {
@@ -579,6 +592,7 @@ mod tests {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
                 admin_addr: None,
+                tls: None,
             },
             audit: None,
             datastore: None,
