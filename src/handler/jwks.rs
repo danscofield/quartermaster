@@ -9,6 +9,14 @@ use axum::Json;
 use crate::server::AppState;
 
 /// GET /jwks.json — returns the JSON Web Key Set for token verification.
+#[utoipa::path(
+    get,
+    path = "/jwks.json",
+    tag = "discovery",
+    responses(
+        (status = 200, description = "JSON Web Key Set"),
+    )
+)]
 pub async fn jwks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.signing_manager.jwks().clone())
 }

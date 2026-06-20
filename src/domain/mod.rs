@@ -125,10 +125,11 @@ impl std::fmt::Display for DomainError {
 impl std::error::Error for DomainError {}
 
 /// The JSON body structure for error responses, following OAuth 2.0 conventions.
-#[derive(Serialize)]
-struct ErrorBody {
-    error: &'static str,
-    error_description: String,
+#[derive(Serialize, utoipa::ToSchema)]
+#[schema(as = ErrorBody)]
+pub struct ErrorBody {
+    pub error: &'static str,
+    pub error_description: String,
 }
 
 impl IntoResponse for DomainError {

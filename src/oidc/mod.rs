@@ -7,7 +7,7 @@ use serde::Serialize;
 /// Serves at `GET /.well-known/openid-configuration` and provides
 /// cloud provider IAM systems with the information needed to verify
 /// Quartermaster-issued JWTs.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct DiscoveryDocument {
     /// The issuer URL matching Quartermaster's configured issuer.
     pub issuer: String,

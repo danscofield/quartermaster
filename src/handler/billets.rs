@@ -15,7 +15,7 @@ use crate::domain::DomainError;
 use crate::server::AppState;
 
 /// Response body for billet metadata.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct BilletMetadataResponse {
     pub name: String,
     pub description: String,
@@ -27,6 +27,21 @@ pub struct BilletMetadataResponse {
 ///
 /// Requires a valid Quartermaster JWT. Evaluates `readBillet` authorization
 /// via the local Cedar evaluator before returning metadata.
+#[utoipa::path(
+    get,
+    path = "/billets/{name}",
+    tag = "discovery",
+    params(
+        ("name" = String, Path, description = "Billet name")
+    ),
+    responses(
+        (status = 200, description = "Billet metadata", body = BilletMetadataResponse),
+        (status = 401, description = "Unauthorized", body = crate::domain::ErrorBody),
+        (status = 403, description = "Forbidden", body = crate::domain::ErrorBody),
+        (status = 404, description = "Not found", body = crate::domain::ErrorBody),
+    ),
+    security(("BearerAuth" = []))
+)]
 pub async fn get_billet(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

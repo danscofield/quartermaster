@@ -19,14 +19,14 @@ use crate::server::AppState;
 use crate::server::middleware::ClientCertificate;
 
 /// Form body for the billet discovery request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct BilletDiscoveryForm {
     pub subject_token: Option<String>,
     pub subject_token_type: Option<String>,
 }
 
 /// JSON response for billet discovery.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct BilletDiscoveryResponse {
     pub billets: Vec<String>,
     pub implicit_billets: Vec<String>,
@@ -40,6 +40,18 @@ pub struct BilletDiscoveryResponse {
 /// directly as a JSON response.
 ///
 /// Returns 200 with empty arrays when the caller has no entitled billets (graceful).
+#[utoipa::path(
+    post,
+    path = "/billets/me",
+    tag = "discovery",
+    request_body(content = BilletDiscoveryForm, content_type = "application/x-www-form-urlencoded"),
+    responses(
+        (status = 200, description = "Discovery result", body = BilletDiscoveryResponse),
+        (status = 400, description = "Bad request", body = crate::domain::ErrorBody),
+        (status = 401, description = "Unauthorized", body = crate::domain::ErrorBody),
+    ),
+    security(("MutualTLS" = []))
+)]
 pub async fn billet_discovery(
     State(state): State<Arc<AppState>>,
     Extension(client_cert): Extension<ClientCertificate>,

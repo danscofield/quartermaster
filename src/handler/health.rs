@@ -11,15 +11,15 @@ use serde::Serialize;
 use crate::keymanager::KeyHealth;
 use crate::server::AppState;
 
-#[derive(Serialize)]
-struct HealthChecks {
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct HealthChecks {
     datastore: String,
     signing_key: String,
     policy_sync: String,
 }
 
-#[derive(Serialize)]
-struct HealthResponse {
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct HealthResponse {
     status: String,
     checks: HealthChecks,
 }
@@ -36,6 +36,14 @@ enum OverallStatus {
 ///
 /// Returns 200 if healthy or degraded, 503 if unhealthy.
 /// Checks DataStore connectivity, KeyManager health, and PolicySync initialization.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "system",
+    responses(
+        (status = 200, description = "Service healthy or degraded", body = HealthResponse),
+    )
+)]
 pub async fn healthz(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut worst_status = OverallStatus::Healthy;
 

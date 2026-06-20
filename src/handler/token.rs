@@ -22,7 +22,7 @@ use crate::server::AppState;
 use crate::server::middleware::ClientCertificate;
 
 /// Form body for the token exchange request (application/x-www-form-urlencoded).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct TokenExchangeForm {
     pub grant_type: Option<String>,
     pub subject_token: Option<String>,
@@ -34,7 +34,7 @@ pub struct TokenExchangeForm {
 }
 
 /// JSON response for a successful token exchange.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct TokenExchangeResponse {
     pub access_token: String,
     pub issued_token_type: String,
@@ -53,6 +53,18 @@ pub struct TokenExchangeResponse {
 /// 1. If `subject_token` is present → use token dispatch (existing path)
 /// 2. If absent, try mTLS identity from client certificate extension
 /// 3. If neither available → return 400
+#[utoipa::path(
+    post,
+    path = "/token",
+    tag = "token-exchange",
+    request_body(content = TokenExchangeForm, content_type = "application/x-www-form-urlencoded"),
+    responses(
+        (status = 200, description = "Token exchange successful", body = TokenExchangeResponse),
+        (status = 400, description = "Bad request", body = crate::domain::ErrorBody),
+        (status = 401, description = "Unauthorized", body = crate::domain::ErrorBody),
+    ),
+    security(("MutualTLS" = []))
+)]
 pub async fn token_exchange(
     State(state): State<Arc<AppState>>,
     Extension(client_cert): Extension<ClientCertificate>,

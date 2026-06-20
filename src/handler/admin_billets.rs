@@ -13,11 +13,11 @@ use crate::domain::admin::authenticator::AdminAuthError;
 use crate::domain::admin::billets::BilletCrudError;
 use crate::domain::admin::policies::PolicyCrudError;
 use crate::domain::audit::schema::{AdminOperationDetails, AuditActor, AuditEnvelope, Outcome};
-use crate::domain::DomainError;
+use crate::domain::{DomainError, ErrorBody};
 use crate::server::AppState;
 
 /// Request body for creating a billet.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreateBilletRequest {
     pub name: String,
     #[serde(default)]
@@ -31,7 +31,7 @@ pub struct CreateBilletRequest {
 }
 
 /// Request body for updating a billet.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdateBilletRequest {
     pub description: Option<String>,
     pub associated_aws_roles: Option<Vec<String>>,
@@ -70,8 +70,8 @@ fn extract_admin_subject(auth_header: &str) -> String {
 }
 
 /// Response body for a billet metadata record.
-#[derive(Debug, Serialize)]
-pub struct BilletMetadataResponse {
+#[derive(Debug, Serialize, utoipa::ToSchema)]
+pub struct AdminBilletMetadataResponse {
     pub name: String,
     pub description: String,
     pub associated_aws_roles: Vec<String>,
@@ -81,6 +81,18 @@ pub struct BilletMetadataResponse {
 }
 
 /// POST /admin/billets — create a new billet metadata record.
+#[utoipa::path(
+    post,
+    path = "/admin/billets",
+    tag = "admin-billets",
+    request_body = CreateBilletRequest,
+    responses(
+        (status = 201, description = "Billet created", body = AdminBilletMetadataResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+    ),
+    security(("BearerAuth" = []))
+)]
 pub async fn create_billet(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -162,7 +174,7 @@ pub async fn create_billet(
         details,
     ));
 
-    let response = BilletMetadataResponse {
+    let response = AdminBilletMetadataResponse {
         name: metadata.name,
         description: metadata.description,
         associated_aws_roles: metadata.associated_aws_roles,
@@ -175,6 +187,17 @@ pub async fn create_billet(
 }
 
 /// GET /admin/billets — list all billets.
+#[utoipa::path(
+    get,
+    path = "/admin/billets",
+    tag = "admin-billets",
+    responses(
+        (status = 200, description = "List of billets", body = Vec<crate::domain::admin::billets::BilletListItem>),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+    ),
+    security(("BearerAuth" = []))
+)]
 pub async fn list_billets(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -198,6 +221,21 @@ pub async fn list_billets(
 }
 
 /// GET /admin/billets/:name — get a single billet by name (with attached policies).
+#[utoipa::path(
+    get,
+    path = "/admin/billets/{name}",
+    tag = "admin-billets",
+    params(
+        ("name" = String, Path, description = "Billet name")
+    ),
+    responses(
+        (status = 200, description = "Billet with policies", body = crate::domain::admin::billets::BilletWithPolicies),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("BearerAuth" = []))
+)]
 pub async fn get_billet(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -222,6 +260,22 @@ pub async fn get_billet(
 }
 
 /// PUT /admin/billets/:name — update a billet's metadata.
+#[utoipa::path(
+    put,
+    path = "/admin/billets/{name}",
+    tag = "admin-billets",
+    params(
+        ("name" = String, Path, description = "Billet name")
+    ),
+    request_body = UpdateBilletRequest,
+    responses(
+        (status = 200, description = "Billet updated", body = AdminBilletMetadataResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("BearerAuth" = []))
+)]
 pub async fn update_billet(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -293,7 +347,7 @@ pub async fn update_billet(
         details,
     ));
 
-    let response = BilletMetadataResponse {
+    let response = AdminBilletMetadataResponse {
         name: metadata.name,
         description: metadata.description,
         associated_aws_roles: metadata.associated_aws_roles,
@@ -306,6 +360,21 @@ pub async fn update_billet(
 }
 
 /// DELETE /admin/billets/:name — delete a billet and all its attached policies (cascade).
+#[utoipa::path(
+    delete,
+    path = "/admin/billets/{name}",
+    tag = "admin-billets",
+    params(
+        ("name" = String, Path, description = "Billet name")
+    ),
+    responses(
+        (status = 204, description = "Billet deleted"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("BearerAuth" = []))
+)]
 pub async fn delete_billet(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -397,7 +466,7 @@ fn map_auth_error(err: AdminAuthError) -> DomainError {
 }
 
 /// Request body for creating a policy under a billet.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct CreatePolicyRequest {
     pub statement: String,
     #[serde(default)]
@@ -405,7 +474,7 @@ pub struct CreatePolicyRequest {
 }
 
 /// Request body for updating a policy under a billet.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct UpdatePolicyRequest {
     pub statement: String,
     #[serde(default)]
@@ -413,7 +482,7 @@ pub struct UpdatePolicyRequest {
 }
 
 /// Response body for a policy record.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct PolicyResponse {
     pub id: String,
     pub statement: String,
@@ -421,6 +490,22 @@ pub struct PolicyResponse {
 }
 
 /// POST /admin/billets/{name}/policies — create a new Cedar policy under a billet.
+#[utoipa::path(
+    post,
+    path = "/admin/billets/{name}/policies",
+    tag = "admin-policies",
+    params(
+        ("name" = String, Path, description = "Billet name")
+    ),
+    request_body = CreatePolicyRequest,
+    responses(
+        (status = 201, description = "Policy created", body = PolicyResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Billet not found", body = ErrorBody),
+    ),
+    security(("BearerAuth" = []))
+)]
 pub async fn create_policy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -497,6 +582,20 @@ pub async fn create_policy(
 }
 
 /// GET /admin/billets/{name}/policies — list all policies for a billet.
+#[utoipa::path(
+    get,
+    path = "/admin/billets/{name}/policies",
+    tag = "admin-policies",
+    params(
+        ("name" = String, Path, description = "Billet name")
+    ),
+    responses(
+        (status = 200, description = "List of policies", body = Vec<PolicyResponse>),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+    ),
+    security(("BearerAuth" = []))
+)]
 pub async fn list_policies(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -530,6 +629,22 @@ pub async fn list_policies(
 }
 
 /// GET /admin/billets/{name}/policies/{id} — get a single policy.
+#[utoipa::path(
+    get,
+    path = "/admin/billets/{name}/policies/{id}",
+    tag = "admin-policies",
+    params(
+        ("name" = String, Path, description = "Billet name"),
+        ("id" = String, Path, description = "Policy ID")
+    ),
+    responses(
+        (status = 200, description = "Policy details", body = PolicyResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("BearerAuth" = []))
+)]
 pub async fn get_policy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -560,6 +675,23 @@ pub async fn get_policy(
 }
 
 /// PUT /admin/billets/{name}/policies/{id} — update a policy.
+#[utoipa::path(
+    put,
+    path = "/admin/billets/{name}/policies/{id}",
+    tag = "admin-policies",
+    params(
+        ("name" = String, Path, description = "Billet name"),
+        ("id" = String, Path, description = "Policy ID")
+    ),
+    request_body = UpdatePolicyRequest,
+    responses(
+        (status = 200, description = "Policy updated", body = PolicyResponse),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("BearerAuth" = []))
+)]
 pub async fn update_policy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -636,6 +768,22 @@ pub async fn update_policy(
 }
 
 /// DELETE /admin/billets/{name}/policies/{id} — delete a policy.
+#[utoipa::path(
+    delete,
+    path = "/admin/billets/{name}/policies/{id}",
+    tag = "admin-policies",
+    params(
+        ("name" = String, Path, description = "Billet name"),
+        ("id" = String, Path, description = "Policy ID")
+    ),
+    responses(
+        (status = 204, description = "Policy deleted"),
+        (status = 401, description = "Unauthorized", body = ErrorBody),
+        (status = 403, description = "Forbidden", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody),
+    ),
+    security(("BearerAuth" = []))
+)]
 pub async fn delete_policy(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

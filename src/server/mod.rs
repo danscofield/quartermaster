@@ -73,6 +73,8 @@ pub struct AppState {
 /// When `false`, only data-plane routes are included (admin routes are served on a separate listener).
 pub fn build_main_router(state: Arc<AppState>, include_admin: bool) -> Router {
     let mut app = Router::new()
+        // OpenAPI spec (unauthenticated)
+        .route("/openapi.json", get(crate::openapi::openapi_json))
         // Data-plane routes
         .route("/token", post(handler::token::token_exchange))
         .route(

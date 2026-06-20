@@ -10,3 +10,4 @@ pub mod spireapi;
 pub mod signing;
 pub mod keymanager;
 pub mod oidc;
+pub mod openapi;

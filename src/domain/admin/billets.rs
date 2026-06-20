@@ -46,7 +46,7 @@ impl std::fmt::Display for BilletCrudError {
 impl std::error::Error for BilletCrudError {}
 
 /// Response for GET /admin/billets/{name} — includes policies.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct BilletWithPolicies {
     pub name: String,
     pub description: String,
@@ -58,7 +58,7 @@ pub struct BilletWithPolicies {
 }
 
 /// Summary of a policy attached to a billet.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct PolicySummary {
     pub id: String,
     pub statement: String,
@@ -66,7 +66,7 @@ pub struct PolicySummary {
 }
 
 /// Represents a billet in the list response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BilletListItem {
     pub name: String,
     pub description: String,
