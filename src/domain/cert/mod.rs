@@ -107,18 +107,18 @@ impl LocalAuthority {
         })
     }
 
-    /// Extract the trust domain from a SPIFFE ID.
+    /// Extract the trust domain from a SPIFFE ID or use a default for non-SPIFFE subjects.
     /// e.g., "spiffe://example.org/workload" -> "example.org"
+    /// e.g., "aws:123:rolename" -> "quartermaster"
     pub(crate) fn extract_trust_domain(spiffe_id: &str) -> Result<&str, CertError> {
-        let stripped = spiffe_id.strip_prefix("spiffe://").ok_or_else(|| {
-            CertError::InvalidCsr(format!(
-                "SPIFFE ID does not start with spiffe://: {}",
-                spiffe_id
-            ))
-        })?;
-        stripped.split('/').next().ok_or_else(|| {
-            CertError::InvalidCsr(format!("cannot extract trust domain from: {}", spiffe_id))
-        })
+        if let Some(stripped) = spiffe_id.strip_prefix("spiffe://") {
+            stripped.split('/').next().ok_or_else(|| {
+                CertError::InvalidCsr(format!("cannot extract trust domain from: {}", spiffe_id))
+            })
+        } else {
+            // Non-SPIFFE identity (AWS, OIDC, GCP) — use "quartermaster" as the billet URI domain
+            Ok("quartermaster")
+        }
     }
 
     /// Verify the self-signature on a CSR using ring.
