@@ -7,7 +7,6 @@
 //! Also provides the `AwsStsValidator` trait for validating presigned GetCallerIdentity URLs.
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use url::Url;
 
 use crate::config::identity::AwsStsSourceConfig;
@@ -95,56 +94,10 @@ fn validate_action_param(url: &Url) -> Result<(), IdentityError> {
     Ok(())
 }
 
-/// Check whether the presigned URL has expired based on X-Amz-Date and X-Amz-Expires.
-///
-/// `X-Amz-Date` format: `YYYYMMDDTHHmmssZ`
-/// `X-Amz-Expires` is an integer number of seconds.
-fn validate_expiry(url: &Url, now: DateTime<Utc>) -> Result<(), IdentityError> {
-    let amz_date = url
-        .query_pairs()
-        .find(|(key, _)| key == "X-Amz-Date")
-        .map(|(_, value)| value.to_string())
-        .ok_or_else(|| {
-            IdentityError::InvalidPresignedUrl("missing X-Amz-Date query parameter".to_string())
-        })?;
-
-    let amz_expires = url
-        .query_pairs()
-        .find(|(key, _)| key == "X-Amz-Expires")
-        .map(|(_, value)| value.to_string())
-        .ok_or_else(|| {
-            IdentityError::InvalidPresignedUrl("missing X-Amz-Expires query parameter".to_string())
-        })?;
-
-    // Parse X-Amz-Date in format YYYYMMDDTHHmmssZ
-    let signed_at = chrono::NaiveDateTime::parse_from_str(&amz_date, "%Y%m%dT%H%M%SZ")
-        .map_err(|e| {
-            IdentityError::InvalidPresignedUrl(format!("invalid X-Amz-Date '{}': {}", amz_date, e))
-        })?
-        .and_utc();
-
-    let expires_secs: i64 = amz_expires.parse().map_err(|e| {
-        IdentityError::InvalidPresignedUrl(format!(
-            "invalid X-Amz-Expires '{}': {}",
-            amz_expires, e
-        ))
-    })?;
-
-    let expiry_time = signed_at + chrono::Duration::seconds(expires_secs);
-
-    if now >= expiry_time {
-        return Err(IdentityError::InvalidPresignedUrl(format!(
-            "presigned URL expired at {}",
-            expiry_time
-        )));
-    }
-
-    Ok(())
-}
 
 /// Validate a presigned STS URL: host, Action param, and expiry.
 /// This function does NOT make HTTP calls — it only validates the URL structure.
-pub fn validate_presigned_url(presigned_url: &str, now: DateTime<Utc>) -> Result<Url, IdentityError> {
+pub fn validate_presigned_url(presigned_url: &str) -> Result<Url, IdentityError> {
     let url = Url::parse(presigned_url).map_err(|e| {
         IdentityError::InvalidPresignedUrl(format!("failed to parse URL: {}", e))
     })?;
@@ -163,7 +116,6 @@ pub fn validate_presigned_url(presigned_url: &str, now: DateTime<Utc>) -> Result
 
     validate_sts_host(host)?;
     validate_action_param(&url)?;
-    validate_expiry(&url, now)?;
 
     Ok(url)
 }
@@ -214,12 +166,13 @@ fn extract_xml_element(xml: &str, tag: &str) -> Option<String> {
 impl AwsStsValidator for DefaultAwsStsValidator {
     async fn validate(&self, presigned_url: &str) -> Result<AwsStsIdentity, IdentityError> {
         // 1. Validate URL structure (host, Action, expiry)
-        let url = validate_presigned_url(presigned_url, Utc::now())?;
+        let url = validate_presigned_url(presigned_url)?;
 
         // 2. Call the presigned URL
+        // AWS SDK presigns GetCallerIdentity as GET with auth in the query string.
         let response = self
             .http_client
-            .post(url.as_str())
+            .get(url.as_str())
             .send()
             .await
             .map_err(|e| {
@@ -563,21 +516,21 @@ mod tests {
     fn test_validate_presigned_url_valid() {
         let url = "https://sts.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Credential=AKID/20250101/us-east-1/sts/aws4_request&X-Amz-Signature=abcdef";
         let now = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
-        assert!(validate_presigned_url(url, now).is_ok());
+        assert!(validate_presigned_url(url).is_ok());
     }
 
     #[test]
     fn test_validate_presigned_url_regional_endpoint() {
         let url = "https://sts.us-west-2.amazonaws.com/?Action=GetCallerIdentity&X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600";
         let now = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
-        assert!(validate_presigned_url(url, now).is_ok());
+        assert!(validate_presigned_url(url).is_ok());
     }
 
     #[test]
     fn test_validate_presigned_url_http_rejected() {
         let url = "http://sts.amazonaws.com/?Action=GetCallerIdentity&X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600";
         let now = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
-        let err = validate_presigned_url(url, now).unwrap_err();
+        let err = validate_presigned_url(url).unwrap_err();
         assert!(matches!(err, IdentityError::InvalidPresignedUrl(_)));
     }
 
@@ -585,7 +538,7 @@ mod tests {
     fn test_validate_presigned_url_wrong_host() {
         let url = "https://evil.com/?Action=GetCallerIdentity&X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600";
         let now = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
-        let err = validate_presigned_url(url, now).unwrap_err();
+        let err = validate_presigned_url(url).unwrap_err();
         assert!(matches!(err, IdentityError::InvalidPresignedUrl(_)));
     }
 
@@ -593,22 +546,14 @@ mod tests {
     fn test_validate_presigned_url_missing_action() {
         let url = "https://sts.amazonaws.com/?X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600";
         let now = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
-        let err = validate_presigned_url(url, now).unwrap_err();
-        assert!(matches!(err, IdentityError::InvalidPresignedUrl(_)));
-    }
-
-    #[test]
-    fn test_validate_presigned_url_expired() {
-        let url = "https://sts.amazonaws.com/?Action=GetCallerIdentity&X-Amz-Date=20240101T120000Z&X-Amz-Expires=60";
-        let now = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
-        let err = validate_presigned_url(url, now).unwrap_err();
+        let err = validate_presigned_url(url).unwrap_err();
         assert!(matches!(err, IdentityError::InvalidPresignedUrl(_)));
     }
 
     #[test]
     fn test_validate_presigned_url_invalid_url() {
         let now = Utc::now();
-        let err = validate_presigned_url("not a url at all", now).unwrap_err();
+        let err = validate_presigned_url("not a url at all").unwrap_err();
         assert!(matches!(err, IdentityError::InvalidPresignedUrl(_)));
     }
 

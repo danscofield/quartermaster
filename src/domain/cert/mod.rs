@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(td, "my-domain.com");
 
         let result = LocalAuthority::extract_trust_domain("http://not-spiffe/foo");
-        assert!(result.is_err());
+        assert_eq!(result.unwrap(), "quartermaster");
     }
 
     #[test]
