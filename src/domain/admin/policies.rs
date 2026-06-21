@@ -238,25 +238,14 @@ impl PolicyCrudService {
     pub async fn list_for_billet(
         &self,
         billet_name: &str,
-    ) -> Result<Vec<crate::dynamo::PolicyRecord>, PolicyCrudError> {
+    ) -> Result<Vec<crate::datastore::PolicyRecord>, PolicyCrudError> {
         let records = self
             .data_store
             .list_policies_for_billet(billet_name)
             .await
             .map_err(|e| PolicyCrudError::InternalError(e.to_string()))?;
 
-        // Convert datastore::PolicyRecord to dynamo::PolicyRecord for backward compatibility
-        Ok(records
-            .into_iter()
-            .map(|r| crate::dynamo::PolicyRecord {
-                billet_name: r.billet_name,
-                policy_id: r.policy_id,
-                statement: r.statement,
-                description: r.description,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            })
-            .collect())
+        Ok(records)
     }
 
     /// Gets a single policy by billet + id.
@@ -266,7 +255,7 @@ impl PolicyCrudService {
         &self,
         billet_name: &str,
         policy_id: &str,
-    ) -> Result<crate::dynamo::PolicyRecord, PolicyCrudError> {
+    ) -> Result<crate::datastore::PolicyRecord, PolicyCrudError> {
         let record = self
             .data_store
             .get_policy(billet_name, policy_id)
@@ -274,14 +263,7 @@ impl PolicyCrudService {
             .map_err(|e| PolicyCrudError::InternalError(e.to_string()))?;
 
         match record {
-            Some(r) => Ok(crate::dynamo::PolicyRecord {
-                billet_name: r.billet_name,
-                policy_id: r.policy_id,
-                statement: r.statement,
-                description: r.description,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            }),
+            Some(r) => Ok(r),
             None => Err(PolicyCrudError::NotFound(policy_id.to_string())),
         }
     }
@@ -298,7 +280,7 @@ impl PolicyCrudService {
         policy_id: &str,
         statement: &str,
         description: &str,
-    ) -> Result<crate::dynamo::PolicyRecord, PolicyCrudError> {
+    ) -> Result<crate::datastore::PolicyRecord, PolicyCrudError> {
         // Validate Cedar statement syntax
         Self::validate_cedar_statement(statement)?;
 
@@ -338,14 +320,7 @@ impl PolicyCrudService {
             .map_err(|e| PolicyCrudError::InternalError(e.to_string()))?;
 
         match record {
-            Some(r) => Ok(crate::dynamo::PolicyRecord {
-                billet_name: r.billet_name,
-                policy_id: r.policy_id,
-                statement: r.statement,
-                description: r.description,
-                created_at: r.created_at,
-                updated_at: r.updated_at,
-            }),
+            Some(r) => Ok(r),
             None => Err(PolicyCrudError::NotFound(policy_id.to_string())),
         }
     }

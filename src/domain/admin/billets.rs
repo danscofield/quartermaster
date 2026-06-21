@@ -5,7 +5,6 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::datastore::{DataStore, BilletRecord};
-use crate::dynamo::BilletMetadata;
 
 use super::tags::validate_tags;
 
@@ -98,7 +97,7 @@ impl BilletCrudService {
         aws_roles: Vec<String>,
         gcp_sas: Vec<String>,
         tags: Vec<String>,
-    ) -> Result<BilletMetadata, BilletCrudError> {
+    ) -> Result<BilletRecord, BilletCrudError> {
         // Validate name is non-empty
         if name.trim().is_empty() {
             return Err(BilletCrudError::NameEmpty);
@@ -134,15 +133,7 @@ impl BilletCrudService {
             .await
             .map_err(|e| BilletCrudError::InternalError(e.to_string()))?;
 
-        // Return legacy BilletMetadata for backward compatibility
-        Ok(BilletMetadata {
-            name: record.name,
-            description: record.description,
-            associated_aws_roles: record.associated_aws_roles,
-            associated_gcp_sas: record.associated_gcp_sas,
-            tags: record.tags,
-            updated_at: record.updated_at,
-        })
+        Ok(record)
     }
 
     /// Lists all billets from the data store (single source of truth).
@@ -168,7 +159,7 @@ impl BilletCrudService {
     }
 
     /// Retrieves a single billet metadata record by name.
-    pub async fn get(&self, name: &str) -> Result<BilletMetadata, BilletCrudError> {
+    pub async fn get(&self, name: &str) -> Result<BilletRecord, BilletCrudError> {
         let record = self
             .data_store
             .get_billet(name)
@@ -176,14 +167,7 @@ impl BilletCrudService {
             .map_err(|e| BilletCrudError::InternalError(e.to_string()))?;
 
         match record {
-            Some(r) => Ok(BilletMetadata {
-                name: r.name,
-                description: r.description,
-                associated_aws_roles: r.associated_aws_roles,
-                associated_gcp_sas: r.associated_gcp_sas,
-                tags: r.tags,
-                updated_at: r.updated_at,
-            }),
+            Some(r) => Ok(r),
             None => Err(BilletCrudError::NotFound(name.to_string())),
         }
     }
@@ -242,7 +226,7 @@ impl BilletCrudService {
         aws_roles: Option<Vec<String>>,
         gcp_sas: Option<Vec<String>>,
         tags: Option<Vec<String>>,
-    ) -> Result<BilletMetadata, BilletCrudError> {
+    ) -> Result<BilletRecord, BilletCrudError> {
         // Validate tags if present
         if let Some(ref new_tags) = tags {
             validate_tags(new_tags).map_err(BilletCrudError::InvalidTags)?;
@@ -283,14 +267,7 @@ impl BilletCrudService {
             .await
             .map_err(|e| BilletCrudError::InternalError(e.to_string()))?;
 
-        Ok(BilletMetadata {
-            name: record.name,
-            description: record.description,
-            associated_aws_roles: record.associated_aws_roles,
-            associated_gcp_sas: record.associated_gcp_sas,
-            tags: record.tags,
-            updated_at: record.updated_at,
-        })
+        Ok(record)
     }
 
     /// Deletes a billet metadata record by name.
