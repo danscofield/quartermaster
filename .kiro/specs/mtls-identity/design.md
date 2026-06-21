@@ -2,343 +2,303 @@
 
 ## Overview
 
-This design adds X.509 client certificates (SPIRE X.509-SVIDs) as an identity source for Quartermaster's token exchange and billet discovery endpoints. When a workload presents a valid client certificate during the TLS handshake, Quartermaster extracts the SPIFFE ID from the certificate's URI SAN and uses it as the authenticated identity — eliminating the need for a `subject_token` in the request body.
+This feature completes the mTLS client certificate identity source in Quartermaster by fixing the broken TLS verifier and wiring the existing `MtlsValidator` into the token exchange and billet discovery handlers. The design follows a "permissive TLS, strict application-layer validation" pattern: the TLS layer accepts all connections regardless of client certificate validity, while the application layer (`MtlsValidator`) performs trust chain verification, time validity checks, and SPIFFE ID extraction against the configured X.509 trust bundle.
 
-The design follows a **permissive TLS + application-layer validation** pattern:
-- The TLS listener accepts all connections regardless of client cert presence or issuer (no handshake rejection).
-- The application layer validates client certs against configured SPIRE trust bundles.
-- The existing `AuthenticatedIdentity::Spire` variant is reused for mTLS-derived identities, with only the audit `source_type` differing (`"mtls-spiffe"` vs `"spire"`).
+### Key Design Decisions
 
-This approach keeps the TLS layer simple (no need to reload trust bundles at the TLS level) and consolidates all identity validation logic in the application layer where it can participate in error reporting, audit logging, and graceful fallback.
+1. **Permissive TLS verifier over strict WebPKI**: Using a custom `ClientCertVerifier` that always succeeds (replacing the broken `WebPkiClientVerifier`) allows trust bundle rotation without server restart and enables graceful fallback to `subject_token` when no valid cert is presented.
+
+2. **Reuse `AuthenticatedIdentity::Spire` variant**: mTLS-derived identities produce the same `SpireIdentity` struct as JWT-SVIDs. This avoids duplicating Cedar entity construction, billet resolution, and token issuance logic. The only distinction is the `SpireAuthSource` enum (for audit `source_type`).
+
+3. **Token precedence**: Explicit `subject_token` always wins over mTLS identity. This prevents confusion when both are present and allows backward-compatible operation.
 
 ## Architecture
 
 ```mermaid
-graph TD
-    subgraph "TLS Layer"
-        CLIENT["Client with X.509-SVID"]
-        TLS["rustls TLS Acceptor<br/>(permissive client auth)"]
-    end
+sequenceDiagram
+    participant Client as Workload (X.509-SVID)
+    participant TLS as TLS Layer (Permissive Verifier)
+    participant MW as Middleware (inject_client_certificate)
+    participant H as Handler (/token, /billets/me)
+    participant MV as MtlsValidator
+    participant Flow as Standard Flow (Rate Limit → Cedar → Issue)
 
-    subgraph "Middleware"
-        EXTRACT["ClientCertExtractor<br/>(reads peer cert from TLS)"]
-    end
-
-    subgraph "Application Layer"
-        VALIDATOR["MtlsValidator<br/>(validates cert chain,<br/>extracts SPIFFE ID)"]
-        HANDLER["/token or /billets/me handler"]
-        DISPATCH["IdentityDispatcher"]
-    end
-
-    subgraph "Identity Resolution"
-        RESOLVER["BilletResolver"]
-        CEDAR["Cedar Evaluator"]
-        ISSUER["Token Issuer"]
-    end
-
-    CLIENT -->|"TLS handshake<br/>(optional client cert)"| TLS
-    TLS -->|"Connection + raw cert bytes"| EXTRACT
-    EXTRACT -->|"Option&lt;Certificate&gt; in extensions"| HANDLER
-    HANDLER -->|"If subject_token present"| DISPATCH
-    HANDLER -->|"If no subject_token,<br/>cert present"| VALIDATOR
-    VALIDATOR -->|"AuthenticatedIdentity::Spire"| HANDLER
-    HANDLER --> RESOLVER
-    RESOLVER --> CEDAR
-    HANDLER --> ISSUER
+    Client->>TLS: TLS handshake with client cert
+    TLS->>TLS: CertificateRequest sent, always accept
+    TLS->>MW: peer_certificates() → PeerCertificates extension
+    MW->>H: ClientCertificate(Some(der_bytes))
+    H->>H: subject_token absent?
+    H->>MV: validate(cert_der)
+    MV->>MV: verify chain against trust anchors
+    MV->>MV: check time validity
+    MV->>MV: extract SPIFFE ID from URI SAN
+    MV-->>H: Some(SpireIdentity)
+    H->>Flow: AuthenticatedIdentity::Spire + SpireAuthSource::MtlsCert
+    Flow-->>H: Token/Discovery response
 ```
 
-### Decision Rationale
+### Component Interaction
 
-- **Permissive TLS**: Using `rustls` with `WebPkiClientVerifier` set to allow unauthenticated connections means we never reject at handshake. This simplifies certificate rotation (no TLS restarts needed when trust bundles change) and provides uniform error reporting through the application layer.
-- **Reuse SpireIdentity variant**: Since X.509-SVIDs and JWT-SVIDs both carry the same SPIFFE ID and follow the same trust model, reusing the `SpireIdentity` struct avoids duplicating Cedar entity construction, selector enrichment, and billet resolution logic. The only difference is the transport mechanism.
-- **Middleware-based cert extraction**: Injecting the client cert into request extensions via middleware keeps handler code clean and allows both `/token` and `/billets/me` handlers to access the cert without coupling to TLS implementation details.
-- **Explicit X.509 trust bundle separation**: SPIRE's JWT JWKS (`jwks_path`) contains public signing keys for JWT-SVID verification — these are *not* CA certificates. For X.509-SVID cert chain validation, you need the actual CA cert PEM (root/intermediates that signed the X.509-SVIDs). A new `x509_bundle_path` field in `[identity.spire]` provides this. When absent, mTLS identity is disabled even if TLS is configured, making activation explicit and safe.
+The architecture has three layers:
+
+1. **TLS Layer** (`src/server/tls.rs`): Custom `ClientCertVerifier` that sends `CertificateRequest` but never rejects. Passes raw DER bytes through `peer_certificates()`.
+
+2. **Middleware Layer** (`src/server/middleware.rs`): Extracts the leaf certificate from `PeerCertificates` into `ClientCertificate(Option<Vec<u8>>)` extension. Already implemented.
+
+3. **Application Layer** (handlers + `MtlsValidator`): Handlers check for `subject_token` first; if absent, attempt mTLS identity extraction via `MtlsValidator::validate()`. Already partially implemented in handlers.
 
 ## Components and Interfaces
 
-### 1. TLS Configuration (`src/config/mod.rs`)
+### 1. Custom ClientCertVerifier (`src/server/tls.rs`)
 
-New optional TLS configuration section:
+The current code uses `WebPkiClientVerifier::builder(empty_roots).allow_unauthenticated().build()` which panics because an empty `RootCertStore` is invalid for WebPKI verification. The fix replaces this with a custom `ClientCertVerifier` implementation.
 
 ```rust
-/// TLS configuration for the server listener.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TlsConfig {
-    /// Path to the PEM-encoded server certificate.
-    pub cert_path: String,
-    /// Path to the PEM-encoded server private key.
-    pub key_path: String,
+/// A permissive client certificate verifier that:
+/// - Sends CertificateRequest to solicit client certs
+/// - Always returns Ok from verify_client_cert (no TLS-layer rejection)
+/// - Passes raw certificate bytes through for application-layer validation
+#[derive(Debug)]
+struct PermissiveClientCertVerifier {
+    /// Supported signature verification algorithms (required by rustls).
+    supported_schemes: Vec<rustls::SignatureScheme>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for PermissiveClientCertVerifier {
+    fn offer_client_auth(&self) -> bool { true }
+    fn client_auth_mandatory(&self) -> bool { false }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] { &[] }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(...) -> Result<...> { ... }
+    fn verify_tls13_signature(...) -> Result<...> { ... }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported_schemes.clone()
+    }
 }
 ```
 
-Added to `ServerConfig`:
+The `build_tls_config()` function replaces the `WebPkiClientVerifier` with `Arc::new(PermissiveClientCertVerifier::new())`.
+
+### 2. MtlsValidator (`src/domain/identity/mtls.rs`)
+
+Already implemented. Key interface:
 
 ```rust
-pub struct ServerConfig {
-    pub host: String,
-    pub port: u16,
-    pub admin_addr: Option<String>,
-    /// Optional TLS configuration. If absent, the server listens on plain HTTP.
-    pub tls: Option<TlsConfig>,
-}
-```
-
-### 1b. SpireSourceConfig Change (`src/config/identity.rs`)
-
-New optional field for the X.509 CA bundle:
-
-```rust
-pub struct SpireSourceConfig {
-    pub trust_domain: String,
-    pub jwks_path: String,
-    pub server_addr: Option<String>,
-    pub audience: String,
-    /// Optional path to PEM-encoded CA certificates for X.509-SVID chain validation.
-    /// These are the root/intermediate CAs that issued the X.509-SVIDs (NOT the JWKS keys).
-    /// When absent, mTLS identity source is disabled.
-    pub x509_bundle_path: Option<String>,
-}
-```
-
-**Startup logic**: `MtlsValidator` is constructed only when *both* `[server.tls]` is configured AND `[identity.spire].x509_bundle_path` is present. If either is missing, `AppState.mtls_validator = None`.
-
-### 2. TLS Acceptor Setup (`src/server/tls.rs`)
-
-New module that builds a `rustls::ServerConfig` with:
-- Server certificate and private key loaded from config paths.
-- Client certificate verification set to **optional** (allow unauthenticated).
-- No client CA roots configured at TLS layer — all verification deferred to application layer.
-
-```rust
-pub fn build_tls_config(tls_config: &TlsConfig) -> Result<rustls::ServerConfig, TlsSetupError>;
-```
-
-Uses `rustls::server::WebPkiClientVerifier::builder(...).allow_unauthenticated()` to accept connections with or without client certs.
-
-### 3. Client Certificate Extraction Middleware (`src/server/middleware.rs`)
-
-An axum middleware/extractor that reads the peer certificate from the TLS connection and injects it into request extensions:
-
-```rust
-/// Newtype for an optional client certificate extracted from the TLS session.
-#[derive(Clone, Debug)]
-pub struct ClientCertificate(pub Option<Vec<u8>>);
-```
-
-The certificate bytes (DER-encoded) are extracted from `tokio-rustls`'s connection metadata and placed into request extensions, accessible by handlers via `Extension<ClientCertificate>`.
-
-### 4. mTLS Validator (`src/domain/identity/mtls.rs`)
-
-New module responsible for application-layer client certificate validation:
-
-```rust
-/// Validates a client certificate against the SPIRE X.509 trust bundle
-/// and extracts the SPIFFE ID from the URI SAN.
-///
-/// Constructed from the CA certificates at `x509_bundle_path` (NOT from `jwks_path`,
-/// which contains JWT signing keys for a different purpose).
-pub struct MtlsValidator {
-    /// Trust anchor certificates (CA certs from SPIRE X.509 trust bundle).
-    trust_anchors: Vec<webpki::TrustAnchor>,
-    /// The expected SPIFFE trust domain for validation.
-    trust_domain: String,
-}
-
 impl MtlsValidator {
-    /// Creates a new validator from PEM-encoded CA certificates loaded from
-    /// `[identity.spire].x509_bundle_path`.
-    ///
-    /// Returns `Err` if the PEM is malformed or contains no valid CA certs.
     pub fn from_pem(ca_pem: &[u8], trust_domain: &str) -> Result<Self, MtlsError>;
-
-    /// Validates a DER-encoded client certificate.
-    ///
-    /// Returns `Some(SpireIdentity)` if the cert:
-    /// 1. Chains to a trust anchor from `x509_bundle_path`
-    /// 2. Is not expired
-    /// 3. Contains a `spiffe://` URI SAN matching the expected trust domain
-    ///
-    /// Returns `None` (not an error) if validation fails — allowing fallback.
     pub fn validate(&self, cert_der: &[u8]) -> Option<SpireIdentity>;
 }
 ```
 
-### 5. Handler Changes (`src/handler/token.rs`, `src/handler/billets_discovery.rs`)
+Validation steps:
+1. Parse DER → `X509Certificate`
+2. Check time validity (`not_before` ≤ now ≤ `not_after`)
+3. Verify signature chains to a trust anchor (issuer DN match + signature verification)
+4. Extract first `spiffe://{trust_domain}/...` URI SAN
+5. Parse environment/region from path segments
 
-Both handlers adopt a unified identity resolution pattern:
+Returns `None` on any failure (silent fallback).
+
+### 3. Handler Integration (`src/handler/token.rs`, `src/handler/billets_discovery.rs`)
+
+Already implemented. Both handlers follow the same pattern:
 
 ```rust
-// 1. Try explicit subject_token first (existing path)
-// 2. If absent, try mTLS identity from request extensions
-// 3. If neither available, return 400
-
-let identity = if let Some(subject_token) = form.subject_token {
-    // Explicit token always takes precedence
-    let subject_token_type = form.subject_token_type.ok_or_else(|| ...)?;
-    state.identity_dispatcher.validate(&subject_token, &subject_token_type).await?
-} else if let Some(mtls_identity) = extract_mtls_identity(&extensions, &state.mtls_validator) {
-    mtls_identity
+let (identity, auth_source) = if let Some(subject_token) = form.subject_token {
+    // Token dispatch (existing path)
+    ...
+} else if let Some(mtls_identity) = extract_mtls_identity(&client_cert, &state) {
+    (AuthenticatedIdentity::Spire(mtls_identity), SpireAuthSource::MtlsCert)
 } else {
     return Err(DomainError::invalid_request(
-        "subject_token is required when no client certificate is presented"
+        "subject_token is required when no client certificate is presented",
     ));
 };
 ```
 
-### 6. Audit Source Type Differentiation
+### 4. SpireAuthSource Enum (`src/domain/identity/mod.rs`)
 
-The `source_type_for_identity` function gains awareness of mTLS origin. Since `AuthenticatedIdentity::Spire` is reused, a flag or wrapper indicates the transport origin:
+Already implemented:
 
 ```rust
-/// Wrapper indicating whether a SpireIdentity came from JWT or mTLS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpireAuthSource {
     JwtSvid,
     MtlsCert,
 }
 ```
 
-The audit logging uses `"mtls-spiffe"` when the source is `MtlsCert`, and `"spire"` for `JwtSvid`.
+Used by `source_type_for_spire_identity()` to return `"spire"` or `"mtls-spiffe"` for audit logging.
 
-### 7. AppState Changes
+### 5. ClientCertificate Middleware (`src/server/middleware.rs`)
+
+Already implemented. Extracts first cert from `PeerCertificates` (injected by TLS layer):
 
 ```rust
-pub struct AppState {
-    // ... existing fields ...
-    /// mTLS client certificate validator.
-    /// `None` when:
-    /// - `[identity.spire]` is not configured, OR
-    /// - `[identity.spire].x509_bundle_path` is absent, OR
-    /// - `[server.tls]` is absent
-    pub mtls_validator: Option<Arc<MtlsValidator>>,
-}
+#[derive(Clone, Debug)]
+pub struct ClientCertificate(pub Option<Vec<u8>>);
 ```
 
 ## Data Models
 
-### SpireIdentity (unchanged)
-
-```rust
-pub struct SpireIdentity {
-    pub spiffe_id: String,
-    pub trust_domain: String,
-    pub environment: String,
-    pub region: String,
-    pub audience: Vec<String>,
-}
-```
-
-When constructed from mTLS, `environment` and `region` are extracted from the SPIFFE ID path segments (same parsing as JWT-SVID), and `audience` is set to an empty vec (X.509-SVIDs don't carry audience claims).
-
-### MtlsError
-
-```rust
-pub enum MtlsError {
-    /// Trust bundle PEM parsing failed.
-    InvalidTrustBundle(String),
-    /// Certificate DER parsing failed.
-    InvalidCertificate(String),
-}
-```
-
-### Configuration TOML Example
+### Configuration
 
 ```toml
-[server]
-host = "0.0.0.0"
-port = 8443
-
 [server.tls]
 cert_path = "/etc/quartermaster/tls/server.crt"
 key_path = "/etc/quartermaster/tls/server.key"
 
 [identity.spire]
 trust_domain = "example.com"
-jwks_path = "/run/spire/agent/jwks.json"           # JWT-SVID verification (public signing keys)
-x509_bundle_path = "/run/spire/agent/bundle.pem"   # X.509 CA certs for mTLS chain validation
+jwks_path = "/run/spire/agent/jwks.json"      # JWT-SVID signing keys
+x509_bundle_path = "/run/spire/agent/bundle.pem" # X.509-SVID CA trust bundle
 audience = "quartermaster.example.com"
 ```
 
-**Important distinction**: `jwks_path` provides JWKS public keys for JWT-SVID signature verification. `x509_bundle_path` provides the PEM-encoded CA certificates (root/intermediate) that issued X.509-SVIDs. These are separate artifacts in SPIRE. The `MtlsValidator` is constructed *only* from `x509_bundle_path`. If `x509_bundle_path` is absent, `mtls_validator` in AppState is `None` and mTLS identity is disabled (even if `[server.tls]` is configured).
+### Identity Flow Data
+
+| Field | Source | Value |
+|-------|--------|-------|
+| `spiffe_id` | URI SAN from client cert | `spiffe://example.com/env/prod/region/us-east-1/workload/api` |
+| `trust_domain` | Configured on `MtlsValidator` | `example.com` |
+| `environment` | Parsed from SPIFFE path | `prod` |
+| `region` | Parsed from SPIFFE path | `us-east-1` |
+| `audience` | N/A for X.509-SVIDs | `[]` (empty) |
+| `auth_source` | Determined at handler layer | `SpireAuthSource::MtlsCert` |
+| `source_type` (audit) | Derived from auth_source | `"mtls-spiffe"` |
+
+### Token Exchange Form (updated)
+
+```rust
+pub struct TokenExchangeForm {
+    pub grant_type: Option<String>,
+    pub subject_token: Option<String>,       // Now optional
+    pub subject_token_type: Option<String>,  // Required only when subject_token is present
+    pub audience: Option<String>,
+    pub csr: Option<String>,
+    pub billets: Option<String>,
+}
+```
+
 
 ## Correctness Properties
 
 *A property is a characteristic or behavior that should hold true across all valid executions of a system — essentially, a formal statement about what the system should do. Properties serve as the bridge between human-readable specifications and machine-verifiable correctness guarantees.*
 
-### Property 1: TLS Permissive Passthrough
+### Property 1: Permissive verifier never rejects
 
-*For any* DER-encoded X.509 certificate (valid, expired, self-signed, or no certificate at all), the TLS handshake SHALL succeed and the certificate (if presented) SHALL be accessible to the application layer unchanged.
+*For any* DER-encoded byte sequence presented as a client certificate (valid, expired, self-signed, malformed, or empty chain), the `PermissiveClientCertVerifier::verify_client_cert` SHALL return `Ok(ClientCertVerified)` — never an `Err`.
 
-**Validates: Requirements 1.2, 1.3, 1.4**
+**Validates: Requirements 1.2**
 
-### Property 2: SPIFFE ID Extraction Correctness
+### Property 2: SPIFFE ID extraction round-trip
 
-*For any* DER-encoded X.509 certificate, `MtlsValidator::validate` SHALL return `Some(SpireIdentity)` if and only if the certificate chains to a configured trust anchor AND contains a `spiffe://` URI SAN matching the configured trust domain. Otherwise, it SHALL return `None`.
+*For any* X.509 certificate that: (a) chains to a trust anchor in the configured bundle, (b) is time-valid, and (c) contains a `spiffe://{trust_domain}/...` URI SAN, `MtlsValidator::validate()` SHALL return `Some(SpireIdentity)` where `spiffe_id` equals the URI SAN value, `trust_domain` equals the configured trust domain, and `environment`/`region` are correctly parsed from path segments.
 
-**Validates: Requirements 2.1, 2.2, 2.3, 2.4**
+**Validates: Requirements 2.2**
 
-### Property 3: mTLS Identity Fallback Produces SpireIdentity
+### Property 3: Invalid certificates produce None
 
-*For any* valid SPIFFE ID extracted from a client certificate via mTLS, when `subject_token` is absent in the request, the system SHALL use a `SpireIdentity` with that SPIFFE ID as the authenticated identity and follow the standard SPIRE resolution path (selector enrichment → Cedar evaluation → billet resolution).
+*For any* DER-encoded certificate that fails at least one of: (a) chain verification against the trust bundle, (b) time validity check, or (c) contains no `spiffe://{trust_domain}/...` URI SAN, `MtlsValidator::validate()` SHALL return `None`.
 
-**Validates: Requirements 3.2, 4.1, 5.1**
+**Validates: Requirements 2.3, 2.4**
 
-### Property 4: Explicit Token Precedence Over mTLS
+### Property 4: mTLS fallback when subject_token is absent
 
-*For any* request where both a valid `subject_token` and a valid mTLS client certificate are present, the authenticated identity SHALL always be derived from the `subject_token`, never from the client certificate.
+*For any* request to `/token` or `/billets/me` where `subject_token` is absent and `ClientCertificate` contains a cert that `MtlsValidator` validates successfully, the handler SHALL use the extracted `SpireIdentity` as `AuthenticatedIdentity::Spire` with `SpireAuthSource::MtlsCert`.
+
+**Validates: Requirements 3.2, 4.1**
+
+### Property 5: Explicit token takes precedence over mTLS
+
+*For any* request to `/token` or `/billets/me` where both `subject_token` is present AND a valid client certificate is presented, the handler SHALL use the identity from token dispatch (ignoring the mTLS identity entirely).
 
 **Validates: Requirements 3.4, 4.2**
 
-### Property 5: Audit Source Type Differentiation
-
-*For any* mTLS-authenticated request, the audit log `source_type` field SHALL be `"mtls-spiffe"`, distinct from `"spire"` which is used for JWT-SVID authenticated requests.
-
-**Validates: Requirements 5.3**
-
 ## Error Handling
 
-| Condition | Response | Audit |
-|-----------|----------|-------|
-| No `subject_token` and no client cert | HTTP 400: `"subject_token is required when no client certificate is presented"` | Failure event with empty actor |
-| No `subject_token`, client cert present but invalid (doesn't chain to trust bundle) | HTTP 400: same message as above (cert is silently ignored) | Failure event with empty actor |
-| No `subject_token`, client cert valid but no `spiffe://` URI SAN | HTTP 400: same message (cert is silently ignored) | Failure event with empty actor |
-| `subject_token` present but invalid | HTTP 401: existing token validation error | Failure event with token type |
-| TLS config references missing cert/key file | Startup panic with clear error message | N/A (server doesn't start) |
-| `x509_bundle_path` references missing file | Startup panic with clear error message | N/A (server doesn't start) |
-| Trust bundle PEM at `x509_bundle_path` is malformed | Startup panic with clear error message | N/A (server doesn't start) |
-| Client cert DER is malformed | Silently ignored (returns `None` from validator) | No audit (no identity established) |
+### TLS Layer Errors
 
-Key principle: **mTLS validation never produces errors visible to the client.** If the cert can't be validated, it's silently ignored and the system falls through to requiring `subject_token`. This prevents information leakage about trust bundle configuration.
+| Condition | Behavior | HTTP Status |
+|-----------|----------|-------------|
+| Server cert/key file not found | Panic at startup (fail-fast) | N/A |
+| Server cert/key malformed PEM | Panic at startup | N/A |
+| TLS handshake failure (protocol error) | Log debug, drop connection | N/A |
+| Client cert absent | Handshake succeeds, `ClientCertificate(None)` | N/A |
+| Client cert malformed/expired/self-signed | Handshake succeeds, cert bytes passed through | N/A |
+
+### Application Layer Errors
+
+| Condition | Behavior | HTTP Status |
+|-----------|----------|-------------|
+| No `subject_token` AND no valid client cert | Return error | 400 |
+| `subject_token` present but invalid | Return error | 401 |
+| `subject_token_type` missing when token present | Return error | 400 |
+| `MtlsValidator` not configured (no x509_bundle_path) | mTLS path unavailable, fall through to 400 | 400 |
+| Cert DER unparseable | `validate()` → None, fall through | 400 (if no token) |
+| Cert expired | `validate()` → None, fall through | 400 (if no token) |
+| Cert untrusted (wrong CA) | `validate()` → None, fall through | 400 (if no token) |
+| Cert has no SPIFFE SAN | `validate()` → None, fall through | 400 (if no token) |
+| Cert has wrong trust domain | `validate()` → None, fall through | 400 (if no token) |
+| Rate limit exceeded | Return error | 429 |
+
+### Design Principle
+
+The mTLS validation is **never** an error in itself. `MtlsValidator::validate()` returns `Option<SpireIdentity>` — `None` means "this cert doesn't give us an identity" and the handler falls through to the next authentication option (subject_token) or returns 400 if nothing is available. This keeps the error surface minimal and predictable.
 
 ## Testing Strategy
 
 ### Unit Tests
 
-- **Config parsing**: Verify `[server.tls]` deserialization, absence = `None`, required fields validated.
-- **SPIFFE ID parsing from URI SAN**: Test extraction from various cert structures.
-- **Handler precedence logic**: Test the if/else chain with mocked identity sources.
-- **Audit source_type mapping**: Verify `"mtls-spiffe"` vs `"spire"` for the two transport paths.
+- `PermissiveClientCertVerifier::verify_client_cert` returns Ok for valid, expired, self-signed, and garbage certs
+- `PermissiveClientCertVerifier::offer_client_auth` returns true, `client_auth_mandatory` returns false
+- `MtlsValidator::from_pem` handles: valid bundle, empty PEM, non-cert PEM, malformed cert DER
+- `MtlsValidator::validate` handles: valid SPIFFE cert, expired cert, untrusted cert, no SAN, wrong trust domain
+- `extract_mtls_identity` helper: returns None when validator is None, None when cert is None, Some when valid
+- `source_type_for_spire_identity(MtlsCert)` returns `"mtls-spiffe"`
+- Handler precedence: token wins, mTLS fallback, 400 when neither
 
-### Property-Based Tests (proptest)
+### Property-Based Tests
 
-Property-based testing is well-suited to this feature because:
-- Certificate validation is a pure function (cert bytes → Option<SpireIdentity>).
-- The input space is large (arbitrary certificates with varying SANs, chains, validity periods).
-- Precedence logic has clear universal properties across all input combinations.
+Property-based tests use the `proptest` crate (already in dev-dependencies). Each property test runs a minimum of 100 iterations.
 
-**Configuration:**
-- Library: `proptest` (already in dev-dependencies)
-- Minimum 100 iterations per property test
-- Each test tagged with: **Feature: mtls-identity, Property {N}: {description}**
-
-**Properties to implement:**
-1. **Property 2** (SPIFFE ID extraction): Generate random SPIFFE IDs, create certs with/without valid chains and URI SANs, verify extraction correctness.
-2. **Property 3** (mTLS fallback): Generate random SpireIdentity values, mock the mTLS validator to return them, verify handler uses mTLS identity when no subject_token.
-3. **Property 4** (token precedence): Generate pairs of (subject_token_identity, mtls_identity), verify subject_token always wins.
-4. **Property 5** (audit source_type): Generate mTLS identities, verify audit event contains "mtls-spiffe".
+| Property | Test Approach | Generator Strategy |
+|----------|--------------|-------------------|
+| P1: Permissive verifier | Generate arbitrary byte sequences as "cert DER", call verify_client_cert | `proptest::collection::vec(any::<u8>(), 0..1024)` |
+| P2: SPIFFE extraction | Generate valid certs with random SPIFFE IDs (varying trust domain paths, environments, regions) | Custom generator producing certs via openssl with parameterized SPIFFE URIs |
+| P3: Invalid certs → None | Generate certs with one of: wrong CA signature, expired time, missing SAN, wrong trust domain | Enum strategy selecting a failure mode, then generating cert matching that mode |
+| P4: mTLS fallback | Generate random SPIFFE IDs, build mock AppState with MtlsValidator, call handler with no subject_token | Combine arb SPIFFE ID with arb environment/region |
+| P5: Token precedence | Generate both a random token identity and random mTLS identity, call handler with both | Pair of independent identity generators |
 
 ### Integration Tests
 
-- **TLS acceptance** (Property 1): Start a real TLS server, connect with various cert configurations, verify all succeed.
-- **End-to-end mTLS flow**: Present a valid X.509-SVID, omit subject_token, verify token is issued with correct SPIFFE ID.
-- **Fallback behavior**: Present invalid cert, omit subject_token, verify 400 response.
-- **Mixed mode**: Present valid cert AND valid subject_token, verify subject_token identity is used.
+- End-to-end TLS connection test: connect with client cert, verify token exchange completes
+- End-to-end without client cert: connect without cert, send subject_token, verify works
+- `build_tls_config` does not panic (regression for the WebPkiClientVerifier bug)
+
+### Test Configuration
+
+```rust
+// Tag format for property tests:
+// Feature: mtls-identity, Property {N}: {description}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    #[test]
+    fn prop_permissive_verifier_never_rejects(cert_der in ...) {
+        // Feature: mtls-identity, Property 1: Permissive verifier never rejects
+        ...
+    }
+}
+```

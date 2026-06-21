@@ -4,11 +4,93 @@ use std::fs;
 use std::io::BufReader;
 use std::sync::Arc;
 
-use rustls::server::WebPkiClientVerifier;
+use rustls::server::danger::ClientCertVerified;
+use rustls::SignatureScheme;
 use rustls::ServerConfig;
 use rustls_pemfile::{certs, private_key};
 
 use crate::config::TlsConfig;
+
+/// A permissive client certificate verifier that:
+/// - Sends CertificateRequest to solicit client certs
+/// - Always returns Ok from verify_client_cert (no TLS-layer rejection)
+/// - Passes raw certificate bytes through for application-layer validation
+///
+/// All actual client certificate validation is deferred to the application
+/// layer (`MtlsValidator`), enabling trust bundle rotation without server
+/// restart and graceful fallback when no valid cert is presented.
+#[derive(Debug)]
+pub(crate) struct PermissiveClientCertVerifier {
+    /// Supported signature verification schemes (required by rustls).
+    supported_schemes: Vec<SignatureScheme>,
+}
+
+impl PermissiveClientCertVerifier {
+    /// Creates a new `PermissiveClientCertVerifier` using the default
+    /// crypto provider's supported signature verification algorithms.
+    pub fn new() -> Self {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let supported_schemes = provider
+            .signature_verification_algorithms
+            .supported_schemes();
+        Self { supported_schemes }
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for PermissiveClientCertVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported_schemes.clone()
+    }
+}
 
 /// Errors that can occur during TLS configuration setup.
 #[derive(Debug)]
@@ -94,14 +176,10 @@ pub fn build_tls_config(tls_config: &TlsConfig) -> Result<ServerConfig, TlsSetup
         })?;
 
     // Build a permissive client cert verifier:
-    // - Uses an empty root cert store (no TLS-layer chain validation)
-    // - allow_unauthenticated() means connections without client certs succeed
+    // - Sends CertificateRequest to solicit client certs
+    // - Never rejects connections based on client cert validity
     // - All actual cert validation is deferred to the application layer
-    let empty_roots = Arc::new(rustls::RootCertStore::empty());
-    let client_verifier = WebPkiClientVerifier::builder(empty_roots)
-        .allow_unauthenticated()
-        .build()
-        .map_err(|e| TlsSetupError::VerifierBuilderError(e.to_string()))?;
+    let client_verifier = Arc::new(PermissiveClientCertVerifier::new());
 
     // Build the server config with the permissive client verifier
     let config = ServerConfig::builder()

@@ -11,6 +11,11 @@ port = 8443
 # Optional: bind admin routes on a separate address
 # admin_addr = "127.0.0.1:9090"
 
+[server.tls]
+cert_path = "./example/keys/http_server.crt"
+key_path = "./example/keys/http_server.key"
+
+
 # Local file-backed storage (no cloud dependencies)
 [datastore]
 backend = "local"

@@ -4,23 +4,37 @@
 
 This spec adds X.509 client certificates (SPIRE X.509-SVIDs) as an identity source for token exchange. When a workload presents a valid client cert during the TLS handshake, Quartermaster extracts the SPIFFE ID from the URI SAN and uses it as the authenticated identity — no `subject_token` needed in the request body.
 
+## Existing Implementation Status
+
+Much of this feature is already built but broken/incomplete:
+
+- **`src/server/tls.rs`** — EXISTS. Has `build_tls_config()` and `serve_tls()`. The verifier code panics because it uses `WebPkiClientVerifier::builder()` with an empty `RootCertStore`. This must be replaced with a custom `ClientCertVerifier`.
+- **`src/server/middleware.rs`** — EXISTS. Has `PeerCertificates` / `ClientCertificate` extraction from TLS sessions.
+- **`src/domain/identity/mtls.rs`** — EXISTS. Has `MtlsValidator` struct with `from_pem()` and `validate()` methods.
+- **`AppState`** — EXISTS. Already has `mtls_validator: Option<Arc<MtlsValidator>>` field.
+- **`main.rs`** — PARTIALLY WIRED. Conditionally constructs `MtlsValidator` from `x509_bundle_path`, but the TLS startup panic prevents testing.
+- **Handler integration** — NOT DONE. Handlers don't check for mTLS identity or make `subject_token` optional.
+
+The remaining work is: (1) fix the TLS verifier to use a custom accept-all implementation, (2) wire the existing `MtlsValidator` + `ClientCertificate` into the token exchange and discovery handlers.
+
 ## Requirements
 
-### Requirement 1: TLS Configuration with Permissive Client Cert Acceptance
+### Requirement 1: TLS Configuration with Permissive Client Cert Passthrough
 
 #### Acceptance Criteria
 
 1. THE server SHALL support TLS termination with configurable server cert and key
-2. THE TLS listener SHALL accept client certificates but SHALL NOT verify them at the handshake layer — all connections succeed regardless of client cert presence or issuer
-3. THE raw client certificate (if presented) SHALL be passed through to the application layer for handler-level validation
+2. THE TLS listener SHALL use a custom `ClientCertVerifier` that accepts all client certificates (valid, expired, self-signed, or absent) without rejecting the handshake — it SHALL send a `CertificateRequest` message so clients present certs, but SHALL always return success from verification
+3. THE custom verifier SHALL pass the raw client certificate bytes through to the application layer (via `peer_certificates()` on the TLS session)
 4. WHEN no client certificate is presented, THE TLS handshake SHALL succeed normally
-5. Configuration:
+5. THIS FIXES the current bug where `WebPkiClientVerifier::builder()` with an empty `RootCertStore` panics on startup — the custom verifier replaces the broken `WebPkiClientVerifier` entirely
+6. Configuration:
    ```toml
    [server.tls]
    cert_path = "/etc/quartermaster/tls/server.crt"
    key_path = "/etc/quartermaster/tls/server.key"
    ```
-6. IF `[server.tls]` is absent, THE server SHALL listen on plain HTTP (current behavior, for local dev)
+7. IF `[server.tls]` is absent, THE server SHALL listen on plain HTTP (current behavior, for local dev)
 
 ### Requirement 2: Application-Layer Client Cert Validation
 
