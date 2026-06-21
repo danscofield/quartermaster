@@ -131,7 +131,7 @@ pub async fn billet_discovery(
 
     // 5. Resolve billets via Cedar evaluation
     //    Use a dummy audience since discovery doesn't target a specific audience.
-    let resolver_input = build_resolver_input(&identity, &subject);
+    let resolver_input = build_resolver_input(&identity, &subject, &state.entity_builder)?;
 
     let resolution = match state.resolver.resolve(resolver_input).await {
         Ok(res) => res,
@@ -229,12 +229,17 @@ fn source_type_from_token_type(token_type: &str) -> String {
 /// Builds a ResolverInput from an AuthenticatedIdentity for discovery.
 ///
 /// Discovery does not have a specific audience, so we use an empty string.
+/// For non-SPIRE sources, builds typed Cedar entities via the entity builder.
 fn build_resolver_input(
     identity: &AuthenticatedIdentity,
     subject: &str,
-) -> crate::domain::billet::ResolverInput {
+    entity_builder: &crate::domain::identity::entity::MultiSourceEntityBuilder,
+) -> Result<crate::domain::billet::ResolverInput, DomainError> {
+    use crate::domain::billet::TypedPrincipal;
+    use crate::domain::identity::entity::{build_cedar_entity, principal_entity_uid};
+
     match identity {
-        AuthenticatedIdentity::Spire(spire) => crate::domain::billet::ResolverInput {
+        AuthenticatedIdentity::Spire(spire) => Ok(crate::domain::billet::ResolverInput {
             spiffe_id: spire.spiffe_id.clone(),
             trust_domain: spire.trust_domain.clone(),
             environment: spire.environment.clone(),
@@ -243,36 +248,43 @@ fn build_resolver_input(
             request_time: chrono::Utc::now(),
             source_cloud: String::new(),
             typed_principal: None,
-        },
-        AuthenticatedIdentity::AwsSts(_) => crate::domain::billet::ResolverInput {
-            spiffe_id: subject.to_string(),
-            trust_domain: String::new(),
-            environment: String::new(),
-            region: String::new(),
-            audience: String::new(),
-            request_time: chrono::Utc::now(),
-            source_cloud: "aws".to_string(),
-            typed_principal: None,
-        },
-        AuthenticatedIdentity::Gcp(_) => crate::domain::billet::ResolverInput {
-            spiffe_id: subject.to_string(),
-            trust_domain: String::new(),
-            environment: String::new(),
-            region: String::new(),
-            audience: String::new(),
-            request_time: chrono::Utc::now(),
-            source_cloud: "gcp".to_string(),
-            typed_principal: None,
-        },
-        AuthenticatedIdentity::Oidc(_) => crate::domain::billet::ResolverInput {
-            spiffe_id: subject.to_string(),
-            trust_domain: String::new(),
-            environment: String::new(),
-            region: String::new(),
-            audience: String::new(),
-            request_time: chrono::Utc::now(),
-            source_cloud: String::new(),
-            typed_principal: None,
-        },
+        }),
+        _ => {
+            let principal = entity_builder.build_principal(identity);
+            let entity = build_cedar_entity(&principal)
+                .map_err(|e| DomainError::service_unavailable(format!("entity construction failed: {e}")))?;
+            let uid = principal_entity_uid(&principal)
+                .map_err(|e| DomainError::service_unavailable(format!("entity construction failed: {e}")))?;
+
+            let principal_type = match identity {
+                AuthenticatedIdentity::Oidc(_) => "OidcIdentity",
+                AuthenticatedIdentity::AwsSts(_) => "AwsRoleIdentity",
+                AuthenticatedIdentity::Gcp(_) => "GcpIdentity",
+                AuthenticatedIdentity::Spire(_) => unreachable!(),
+            };
+
+            let source_cloud = match identity {
+                AuthenticatedIdentity::AwsSts(_) => "aws",
+                AuthenticatedIdentity::Gcp(_) => "gcp",
+                _ => "",
+            };
+
+            Ok(crate::domain::billet::ResolverInput {
+                spiffe_id: subject.to_string(),
+                trust_domain: String::new(),
+                environment: String::new(),
+                region: String::new(),
+                audience: String::new(),
+                request_time: chrono::Utc::now(),
+                source_cloud: source_cloud.to_string(),
+                typed_principal: Some(TypedPrincipal {
+                    principal_type: principal_type.to_string(),
+                    principal_id: uid.id().unescaped().to_string(),
+                    entities: vec![entity],
+                    source_type: source_type_for_identity(identity).to_string(),
+                    source_cloud: source_cloud.to_string(),
+                }),
+            })
+        }
     }
 }

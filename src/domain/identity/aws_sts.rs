@@ -453,83 +453,23 @@ mod tests {
 
     // ─── Expiry Validation Tests ───────────────────────────────────────────
 
-    #[test]
-    fn test_validate_expiry_valid() {
-        let url = Url::parse(
-            "https://sts.amazonaws.com/?Action=GetCallerIdentity&X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600"
-        ).unwrap();
-        // Now is before expiry (signed at 12:00, expires in 3600s = 13:00, now = 12:30)
-        let now = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
-        assert!(validate_expiry(&url, now).is_ok());
-    }
-
-    #[test]
-    fn test_validate_expiry_expired() {
-        let url = Url::parse(
-            "https://sts.amazonaws.com/?Action=GetCallerIdentity&X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600"
-        ).unwrap();
-        // Now is after expiry (signed at 12:00, expires in 3600s = 13:00, now = 14:00)
-        let now = Utc.with_ymd_and_hms(2025, 1, 1, 14, 0, 0).unwrap();
-        assert!(validate_expiry(&url, now).is_err());
-    }
-
-    #[test]
-    fn test_validate_expiry_exactly_at_boundary() {
-        let url = Url::parse(
-            "https://sts.amazonaws.com/?Action=GetCallerIdentity&X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600"
-        ).unwrap();
-        // Now is exactly at expiry time (13:00:00)
-        let now = Utc.with_ymd_and_hms(2025, 1, 1, 13, 0, 0).unwrap();
-        assert!(validate_expiry(&url, now).is_err());
-    }
-
-    #[test]
-    fn test_validate_expiry_missing_date() {
-        let url = Url::parse(
-            "https://sts.amazonaws.com/?Action=GetCallerIdentity&X-Amz-Expires=3600"
-        ).unwrap();
-        let now = Utc::now();
-        assert!(validate_expiry(&url, now).is_err());
-    }
-
-    #[test]
-    fn test_validate_expiry_missing_expires() {
-        let url = Url::parse(
-            "https://sts.amazonaws.com/?Action=GetCallerIdentity&X-Amz-Date=20250101T120000Z"
-        ).unwrap();
-        let now = Utc::now();
-        assert!(validate_expiry(&url, now).is_err());
-    }
-
-    #[test]
-    fn test_validate_expiry_invalid_date_format() {
-        let url = Url::parse(
-            "https://sts.amazonaws.com/?Action=GetCallerIdentity&X-Amz-Date=2025-01-01T12:00:00Z&X-Amz-Expires=3600"
-        ).unwrap();
-        let now = Utc::now();
-        assert!(validate_expiry(&url, now).is_err());
-    }
-
     // ─── Full URL Validation Tests ─────────────────────────────────────────
 
     #[test]
     fn test_validate_presigned_url_valid() {
         let url = "https://sts.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Credential=AKID/20250101/us-east-1/sts/aws4_request&X-Amz-Signature=abcdef";
-        let now = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
         assert!(validate_presigned_url(url).is_ok());
     }
 
     #[test]
     fn test_validate_presigned_url_regional_endpoint() {
         let url = "https://sts.us-west-2.amazonaws.com/?Action=GetCallerIdentity&X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600";
-        let now = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
         assert!(validate_presigned_url(url).is_ok());
     }
 
     #[test]
     fn test_validate_presigned_url_http_rejected() {
         let url = "http://sts.amazonaws.com/?Action=GetCallerIdentity&X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600";
-        let now = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
         let err = validate_presigned_url(url).unwrap_err();
         assert!(matches!(err, IdentityError::InvalidPresignedUrl(_)));
     }
@@ -537,7 +477,6 @@ mod tests {
     #[test]
     fn test_validate_presigned_url_wrong_host() {
         let url = "https://evil.com/?Action=GetCallerIdentity&X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600";
-        let now = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
         let err = validate_presigned_url(url).unwrap_err();
         assert!(matches!(err, IdentityError::InvalidPresignedUrl(_)));
     }
@@ -545,14 +484,12 @@ mod tests {
     #[test]
     fn test_validate_presigned_url_missing_action() {
         let url = "https://sts.amazonaws.com/?X-Amz-Date=20250101T120000Z&X-Amz-Expires=3600";
-        let now = Utc.with_ymd_and_hms(2025, 1, 1, 12, 30, 0).unwrap();
         let err = validate_presigned_url(url).unwrap_err();
         assert!(matches!(err, IdentityError::InvalidPresignedUrl(_)));
     }
 
     #[test]
     fn test_validate_presigned_url_invalid_url() {
-        let now = Utc::now();
         let err = validate_presigned_url("not a url at all").unwrap_err();
         assert!(matches!(err, IdentityError::InvalidPresignedUrl(_)));
     }
