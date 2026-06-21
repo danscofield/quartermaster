@@ -1,12 +1,10 @@
 // Billet resolution orchestration + trait
 
-pub mod entity_builder;
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cedar_policy::Decision;
+use cedar_policy::{Decision, Entity};
 use tracing::{info, warn};
 
 use crate::cedar::{
@@ -24,6 +22,21 @@ pub struct Resolution {
     pub cache_hit: bool,
 }
 
+/// Pre-built typed principal for non-SPIRE sources.
+#[derive(Debug, Clone)]
+pub struct TypedPrincipal {
+    /// Cedar entity type name (e.g., "OidcIdentity", "AwsRoleIdentity", "GcpIdentity")
+    pub principal_type: String,
+    /// Principal entity ID (e.g., email, role_arn)
+    pub principal_id: String,
+    /// Pre-built Cedar entities
+    pub entities: Vec<Entity>,
+    /// Source type for context (e.g., "oidc", "aws-sts", "gcp")
+    pub source_type: String,
+    /// Source cloud for context (e.g., "", "aws", "gcp")
+    pub source_cloud: String,
+}
+
 /// ResolverInput contains the workload attributes needed for Cedar evaluation.
 #[derive(Debug, Clone)]
 pub struct ResolverInput {
@@ -34,6 +47,8 @@ pub struct ResolverInput {
     pub audience: String,
     pub request_time: chrono::DateTime<chrono::Utc>,
     pub source_cloud: String,
+    /// When set, skips path-pattern extraction and uses these pre-built entities.
+    pub typed_principal: Option<TypedPrincipal>,
 }
 
 /// BilletError represents errors that can occur during billet resolution.
@@ -146,32 +161,50 @@ impl Resolver for BilletResolverImpl {
 
         let resources: Vec<String> = known_billets.into_iter().collect();
 
-        // Step 2: Extract attributes from the SPIFFE ID path using regex captures
-        let captures = self.path_pattern_matcher.extract(&input.spiffe_id);
+        // Step 2-4: Build entity authorization request.
+        // Branch on whether typed_principal is provided (non-SPIRE) or not (SPIRE path).
+        let entity_req = if let Some(typed) = &input.typed_principal {
+            // Non-SPIRE path: use pre-built typed entities directly
+            EntityBatchAuthzRequest {
+                principal_type: typed.principal_type.clone(),
+                principal_id: typed.principal_id.clone(),
+                principal_entities: typed.entities.clone(),
+                action: "assumeBillet".to_string(),
+                resources,
+                context: CommonContext {
+                    environment: input.environment.clone(),
+                    region: input.region.clone(),
+                    request_time: input.request_time.to_rfc3339(),
+                    source_type: typed.source_type.clone(),
+                    source_cloud: typed.source_cloud.clone(),
+                    selectors: vec![],
+                },
+            }
+        } else {
+            // Existing SPIRE path: extract from path pattern
+            let captures = self.path_pattern_matcher.extract(&input.spiffe_id);
+            let principal_entities = build_workload_entities_from_captures(
+                &input.spiffe_id,
+                &input.trust_domain,
+                &captures,
+            )
+            .map_err(|e| BilletError::InternalError(format!("entity construction failed: {e}")))?;
 
-        // Step 3: Build Cedar entities from captures
-        let principal_entities = build_workload_entities_from_captures(
-            &input.spiffe_id,
-            &input.trust_domain,
-            &captures,
-        )
-        .map_err(|e| BilletError::InternalError(format!("entity construction failed: {e}")))?;
-
-        // Step 4: Call Cedar authorization with entity-based evaluation
-        let entity_req = EntityBatchAuthzRequest {
-            principal_type: "Workload".to_string(),
-            principal_id: input.spiffe_id.clone(),
-            principal_entities,
-            action: "assumeBillet".to_string(),
-            resources,
-            context: CommonContext {
-                environment: input.environment.clone(),
-                region: input.region.clone(),
-                request_time: input.request_time.to_rfc3339(),
-                source_type: "spire".to_string(),
-                source_cloud: input.source_cloud.clone(),
-                selectors: vec![], // Always empty in path-pattern mode
-            },
+            EntityBatchAuthzRequest {
+                principal_type: "Workload".to_string(),
+                principal_id: input.spiffe_id.clone(),
+                principal_entities,
+                action: "assumeBillet".to_string(),
+                resources,
+                context: CommonContext {
+                    environment: input.environment.clone(),
+                    region: input.region.clone(),
+                    request_time: input.request_time.to_rfc3339(),
+                    source_type: "spire".to_string(),
+                    source_cloud: input.source_cloud.clone(),
+                    selectors: vec![],
+                },
+            }
         };
 
         let decisions = self
@@ -292,6 +325,7 @@ mod tests {
             audience: "https://api.example.com".to_string(),
             request_time: chrono::Utc::now(),
             source_cloud: "aws".to_string(),
+            typed_principal: None,
         }
     }
 
@@ -730,6 +764,7 @@ mod tests {
             audience: "https://api.example.com".to_string(),
             request_time: chrono::Utc::now(),
             source_cloud: String::new(),
+            typed_principal: None,
         };
 
         let result = resolver.resolve(input).await.unwrap();
@@ -786,6 +821,7 @@ mod tests {
             audience: "https://api.example.com".to_string(),
             request_time: chrono::Utc::now(),
             source_cloud: String::new(),
+            typed_principal: None,
         };
 
         let result = resolver.resolve(input).await.unwrap();

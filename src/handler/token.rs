@@ -9,10 +9,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::audit::IdentityAuditDetails;
 use crate::domain::audit::schema::{AuditActor, AuditEnvelope, TokenExchangeDetails};
-use crate::domain::billet::{BilletError, ResolverInput, scope_billets};
+use crate::domain::billet::{BilletError, ResolverInput, TypedPrincipal, scope_billets};
 use crate::domain::cert::CertIssueRequest;
 use crate::domain::identity::claims::build_identity_claim;
-use crate::domain::identity::entity::{source_type_for_identity, source_type_for_spire_identity};
+use crate::domain::identity::entity::{
+    build_cedar_entity, principal_entity_uid, source_type_for_identity,
+    source_type_for_spire_identity, MultiSourceEntityBuilder,
+};
 use crate::domain::identity::implicit::assemble_token_billets;
 use crate::domain::identity::subject::format_subject;
 use crate::domain::identity::{AuthenticatedIdentity, IdentityError, SpireAuthSource};
@@ -171,7 +174,7 @@ pub async fn token_exchange(
     // 5. Resolve billets via Cedar evaluation
     //    For SPIRE: use the spiffe_id directly (backward compat).
     //    For other sources: use the formatted subject as the resolver key.
-    let resolver_input = build_resolver_input(&identity, &subject, &audience);
+    let resolver_input = build_resolver_input(&identity, &subject, &audience, &state.entity_builder)?;
 
     let resolution = state.resolver.resolve(resolver_input).await.map_err(|e| {
         let actor = AuditActor {
@@ -374,14 +377,15 @@ fn source_type_from_token_type(token_type: &str) -> String {
 /// Builds a ResolverInput from an AuthenticatedIdentity.
 ///
 /// For SPIRE, uses the SPIFFE ID and claims directly (backward-compatible).
-/// For other sources, uses the formatted subject as the key with minimal defaults.
+/// For other sources, builds a `TypedPrincipal` with pre-constructed Cedar entities.
 fn build_resolver_input(
     identity: &AuthenticatedIdentity,
     subject: &str,
     audience: &str,
-) -> ResolverInput {
+    entity_builder: &MultiSourceEntityBuilder,
+) -> Result<ResolverInput, DomainError> {
     match identity {
-        AuthenticatedIdentity::Spire(spire) => ResolverInput {
+        AuthenticatedIdentity::Spire(spire) => Ok(ResolverInput {
             spiffe_id: spire.spiffe_id.clone(),
             trust_domain: spire.trust_domain.clone(),
             environment: spire.environment.clone(),
@@ -389,34 +393,50 @@ fn build_resolver_input(
             audience: audience.to_string(),
             request_time: chrono::Utc::now(),
             source_cloud: String::new(),
-        },
-        AuthenticatedIdentity::AwsSts(_) => ResolverInput {
-            spiffe_id: subject.to_string(),
-            trust_domain: String::new(),
-            environment: String::new(),
-            region: String::new(),
-            audience: audience.to_string(),
-            request_time: chrono::Utc::now(),
-            source_cloud: "aws".to_string(),
-        },
-        AuthenticatedIdentity::Gcp(_) => ResolverInput {
-            spiffe_id: subject.to_string(),
-            trust_domain: String::new(),
-            environment: String::new(),
-            region: String::new(),
-            audience: audience.to_string(),
-            request_time: chrono::Utc::now(),
-            source_cloud: "gcp".to_string(),
-        },
-        AuthenticatedIdentity::Oidc(_) => ResolverInput {
-            spiffe_id: subject.to_string(),
-            trust_domain: String::new(),
-            environment: String::new(),
-            region: String::new(),
-            audience: audience.to_string(),
-            request_time: chrono::Utc::now(),
-            source_cloud: String::new(),
-        },
+            typed_principal: None,
+        }),
+        _ => {
+            let principal = entity_builder.build_principal(identity);
+            let entity = build_cedar_entity(&principal)
+                .map_err(|e| DomainError::service_unavailable(format!("entity construction failed: {e}")))?;
+            let uid = principal_entity_uid(&principal)
+                .map_err(|e| DomainError::service_unavailable(format!("entity construction failed: {e}")))?;
+
+            let principal_type = match identity {
+                AuthenticatedIdentity::Oidc(_) => "OidcIdentity",
+                AuthenticatedIdentity::AwsSts(_) => "AwsRoleIdentity",
+                AuthenticatedIdentity::Gcp(_) => "GcpIdentity",
+                AuthenticatedIdentity::Spire(_) => unreachable!(),
+            };
+
+            let source_cloud = match identity {
+                AuthenticatedIdentity::Oidc(_) => "",
+                AuthenticatedIdentity::AwsSts(_) => "aws",
+                AuthenticatedIdentity::Gcp(_) => "gcp",
+                AuthenticatedIdentity::Spire(_) => unreachable!(),
+            };
+
+            let source_type = source_type_for_identity(identity);
+
+            let typed_principal = TypedPrincipal {
+                principal_type: principal_type.to_string(),
+                principal_id: uid.id().unescaped().to_string(),
+                entities: vec![entity],
+                source_type: source_type.to_string(),
+                source_cloud: source_cloud.to_string(),
+            };
+
+            Ok(ResolverInput {
+                spiffe_id: subject.to_string(),
+                trust_domain: String::new(),
+                environment: String::new(),
+                region: String::new(),
+                audience: audience.to_string(),
+                request_time: chrono::Utc::now(),
+                source_cloud: source_cloud.to_string(),
+                typed_principal: Some(typed_principal),
+            })
+        }
     }
 }
 

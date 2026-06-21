@@ -7,8 +7,6 @@ use cedar_policy::{
     Context, Entity, EntityId, EntityTypeName, EntityUid, RestrictedExpression,
 };
 
-use crate::cedar::WorkloadEntity;
-use crate::domain::billet::entity_builder::{EntityBuilder, EntityBuilderInput};
 use crate::domain::identity::{
     AuthenticatedIdentity, AwsStsIdentity, GcpIdentity, OidcIdentity, SpireAuthSource,
 };
@@ -48,22 +46,23 @@ impl std::error::Error for EntityBuildError {}
 /// A Cedar principal entity for any identity source.
 #[derive(Debug, Clone)]
 pub enum CedarPrincipal {
-    /// SPIRE workload entity (delegated to existing EntityBuilder)
-    Workload(WorkloadEntity),
-    /// Human identity from OIDC IdP
-    Human(HumanEntity),
+    /// OIDC identity (human or service) from an OIDC IdP
+    Oidc(OidcEntity),
     /// AWS IAM role identity from presigned STS
     AwsRole(AwsRoleEntity),
     /// GCP workload/service account identity
     GcpWorkload(GcpWorkloadEntity),
 }
 
-/// Cedar entity representation of a human identity from an OIDC IdP.
+/// Cedar entity representation of an OIDC identity (human or service).
 #[derive(Debug, Clone)]
-pub struct HumanEntity {
+pub struct OidcEntity {
     pub email: String,
     pub idp_prefix: String,
+    pub subject: String,
+    pub subject_type: String,
     pub groups: Vec<String>,
+    pub claims: Vec<String>,
 }
 
 /// Cedar entity representation of an AWS IAM role identity.
@@ -84,39 +83,30 @@ pub struct GcpWorkloadEntity {
 }
 
 /// Builds Cedar principal entities from any AuthenticatedIdentity variant.
-pub struct MultiSourceEntityBuilder {
-    /// Existing EntityBuilder for SPIRE-sourced identities.
-    spire_builder: EntityBuilder,
-}
+pub struct MultiSourceEntityBuilder;
 
 impl MultiSourceEntityBuilder {
-    /// Creates a new MultiSourceEntityBuilder wrapping the existing SPIRE entity builder.
-    pub fn new(spire_builder: EntityBuilder) -> Self {
-        Self { spire_builder }
+    /// Creates a new MultiSourceEntityBuilder.
+    pub fn new() -> Self {
+        Self
     }
 
     /// Builds a CedarPrincipal from an AuthenticatedIdentity.
     ///
-    /// For SPIRE identities, `selectors` are used for platform detection.
-    /// For other sources, selectors are ignored.
+    /// Only handles non-SPIRE sources. SPIRE identities use path-pattern extraction
+    /// and `build_workload_entities_from_captures` directly in the resolver.
     pub fn build_principal(
         &self,
         identity: &AuthenticatedIdentity,
-        selectors: &[String],
     ) -> CedarPrincipal {
         match identity {
-            AuthenticatedIdentity::Spire(spire) => {
-                let input = EntityBuilderInput {
-                    spiffe_id: spire.spiffe_id.clone(),
-                    trust_domain: spire.trust_domain.clone(),
-                    environment: spire.environment.clone(),
-                    region: spire.region.clone(),
-                    selectors: selectors.to_vec(),
-                };
-                CedarPrincipal::Workload(self.spire_builder.build(input))
+            AuthenticatedIdentity::Spire(_) => {
+                // SPIRE identities are no longer routed through MultiSourceEntityBuilder.
+                // They use path-pattern extraction in the resolver directly.
+                panic!("SPIRE identities should not be routed through MultiSourceEntityBuilder")
             }
             AuthenticatedIdentity::Oidc(oidc) => {
-                CedarPrincipal::Human(Self::build_human_entity(oidc))
+                CedarPrincipal::Oidc(Self::build_oidc_entity(oidc))
             }
             AuthenticatedIdentity::AwsSts(aws) => {
                 CedarPrincipal::AwsRole(Self::build_aws_role_entity(aws))
@@ -127,9 +117,10 @@ impl MultiSourceEntityBuilder {
         }
     }
 
-    /// Builds a HumanEntity from an OidcIdentity.
-    /// Flattens all values from the claims map into a single `groups` set.
-    fn build_human_entity(oidc: &OidcIdentity) -> HumanEntity {
+    /// Builds an OidcEntity from an OidcIdentity.
+    /// Flattens all values from the claims map into a single `groups` set,
+    /// and builds origin-preserving `claims` as "claim_name:value" strings.
+    fn build_oidc_entity(oidc: &OidcIdentity) -> OidcEntity {
         let mut groups: Vec<String> = oidc
             .claims
             .values()
@@ -139,10 +130,23 @@ impl MultiSourceEntityBuilder {
         groups.sort();
         groups.dedup();
 
-        HumanEntity {
+        let mut claims: Vec<String> = oidc
+            .claims
+            .iter()
+            .flat_map(|(claim_name, values)| {
+                values.iter().map(move |v| format!("{claim_name}:{v}"))
+            })
+            .collect();
+        claims.sort();
+        claims.dedup();
+
+        OidcEntity {
             email: oidc.email.clone(),
             idp_prefix: oidc.idp_prefix.clone(),
+            subject: oidc.subject.clone(),
+            subject_type: "human".to_string(),
             groups,
+            claims,
         }
     }
 
@@ -169,30 +173,19 @@ impl MultiSourceEntityBuilder {
 /// Constructs a Cedar Entity from a CedarPrincipal for use in policy evaluation.
 pub fn build_cedar_entity(principal: &CedarPrincipal) -> Result<Entity, EntityBuildError> {
     match principal {
-        CedarPrincipal::Human(human) => build_human_cedar_entity(human),
+        CedarPrincipal::Oidc(oidc) => build_oidc_cedar_entity(oidc),
         CedarPrincipal::AwsRole(aws) => build_aws_cedar_entity(aws),
         CedarPrincipal::GcpWorkload(gcp) => build_gcp_cedar_entity(gcp),
-        CedarPrincipal::Workload(_) => {
-            // SPIRE workload entities are constructed by the existing cedar module.
-            // This path shouldn't be called directly — use build_workload_entities from cedar mod.
-            Err(EntityBuildError::InvalidEntityType(
-                "Use existing Cedar workload entity builder for SPIRE identities".to_string(),
-            ))
-        }
     }
 }
 
 /// Constructs the Cedar EntityUid for a CedarPrincipal.
 pub fn principal_entity_uid(principal: &CedarPrincipal) -> Result<EntityUid, EntityBuildError> {
     match principal {
-        CedarPrincipal::Human(human) => make_entity_uid("HumanIdentity", &human.email),
+        CedarPrincipal::Oidc(oidc) => make_entity_uid("OidcIdentity", &oidc.email),
         CedarPrincipal::AwsRole(aws) => make_entity_uid("AwsRoleIdentity", &aws.role_arn),
         CedarPrincipal::GcpWorkload(gcp) => {
             make_entity_uid("GcpIdentity", &gcp.email)
-        }
-        CedarPrincipal::Workload(w) => {
-            // For SPIRE workloads, the entity UID uses the SPIFFE ID
-            make_entity_uid("Workload", &w.spiffe_id)
         }
     }
 }
@@ -292,22 +285,34 @@ fn string_set_expr(values: &[String]) -> RestrictedExpression {
     )
 }
 
-/// Builds a Cedar Entity for a HumanIdentity principal.
-fn build_human_cedar_entity(human: &HumanEntity) -> Result<Entity, EntityBuildError> {
-    let uid = make_entity_uid("HumanIdentity", &human.email)?;
+/// Builds a Cedar Entity for an OidcIdentity principal.
+fn build_oidc_cedar_entity(oidc: &OidcEntity) -> Result<Entity, EntityBuildError> {
+    let uid = make_entity_uid("OidcIdentity", &oidc.email)?;
 
     let mut attrs: HashMap<String, RestrictedExpression> = HashMap::new();
     attrs.insert(
         "email".to_string(),
-        RestrictedExpression::new_string(human.email.clone()),
+        RestrictedExpression::new_string(oidc.email.clone()),
     );
     attrs.insert(
         "idp_prefix".to_string(),
-        RestrictedExpression::new_string(human.idp_prefix.clone()),
+        RestrictedExpression::new_string(oidc.idp_prefix.clone()),
     );
     attrs.insert(
         "groups".to_string(),
-        string_set_expr(&human.groups),
+        string_set_expr(&oidc.groups),
+    );
+    attrs.insert(
+        "subject".to_string(),
+        RestrictedExpression::new_string(oidc.subject.clone()),
+    );
+    attrs.insert(
+        "subject_type".to_string(),
+        RestrictedExpression::new_string(oidc.subject_type.clone()),
+    );
+    attrs.insert(
+        "claims".to_string(),
+        string_set_expr(&oidc.claims),
     );
 
     Entity::new(uid, attrs, HashSet::new())
@@ -416,30 +421,30 @@ mod tests {
 
     #[test]
     fn test_build_human_entity_from_oidc() {
-        let builder = MultiSourceEntityBuilder::new(EntityBuilder::new());
+        let builder = MultiSourceEntityBuilder::new();
         let oidc = make_oidc_identity();
         let identity = AuthenticatedIdentity::Oidc(oidc.clone());
 
-        let principal = builder.build_principal(&identity, &[]);
+        let principal = builder.build_principal(&identity);
 
         match principal {
-            CedarPrincipal::Human(human) => {
-                assert_eq!(human.email, "alice@corp.example.com");
-                assert_eq!(human.idp_prefix, "okta");
+            CedarPrincipal::Oidc(entity) => {
+                assert_eq!(entity.email, "alice@corp.example.com");
+                assert_eq!(entity.idp_prefix, "okta");
                 // groups should be flattened from all claims, sorted and deduped
-                assert!(human.groups.contains(&"engineering".to_string()));
-                assert!(human.groups.contains(&"billing-ops".to_string()));
-                assert!(human.groups.contains(&"admin".to_string()));
-                assert!(human.groups.contains(&"reader".to_string()));
-                assert_eq!(human.groups.len(), 4);
+                assert!(entity.groups.contains(&"engineering".to_string()));
+                assert!(entity.groups.contains(&"billing-ops".to_string()));
+                assert!(entity.groups.contains(&"admin".to_string()));
+                assert!(entity.groups.contains(&"reader".to_string()));
+                assert_eq!(entity.groups.len(), 4);
             }
-            _ => panic!("Expected CedarPrincipal::Human"),
+            _ => panic!("Expected CedarPrincipal::Oidc"),
         }
     }
 
     #[test]
     fn test_build_human_entity_deduplicates_groups() {
-        let builder = MultiSourceEntityBuilder::new(EntityBuilder::new());
+        let builder = MultiSourceEntityBuilder::new();
         let oidc = OidcIdentity {
             email: "bob@example.com".to_string(),
             idp_prefix: "azure".to_string(),
@@ -451,23 +456,23 @@ mod tests {
         };
         let identity = AuthenticatedIdentity::Oidc(oidc);
 
-        let principal = builder.build_principal(&identity, &[]);
+        let principal = builder.build_principal(&identity);
 
         match principal {
-            CedarPrincipal::Human(human) => {
+            CedarPrincipal::Oidc(entity) => {
                 // "admins" appears in both claims but should be deduped
-                assert_eq!(human.groups.len(), 3);
-                assert!(human.groups.contains(&"admins".to_string()));
-                assert!(human.groups.contains(&"ops".to_string()));
-                assert!(human.groups.contains(&"reader".to_string()));
+                assert_eq!(entity.groups.len(), 3);
+                assert!(entity.groups.contains(&"admins".to_string()));
+                assert!(entity.groups.contains(&"ops".to_string()));
+                assert!(entity.groups.contains(&"reader".to_string()));
             }
-            _ => panic!("Expected CedarPrincipal::Human"),
+            _ => panic!("Expected CedarPrincipal::Oidc"),
         }
     }
 
     #[test]
     fn test_build_human_entity_empty_claims() {
-        let builder = MultiSourceEntityBuilder::new(EntityBuilder::new());
+        let builder = MultiSourceEntityBuilder::new();
         let oidc = OidcIdentity {
             email: "user@example.com".to_string(),
             idp_prefix: "custom".to_string(),
@@ -476,25 +481,25 @@ mod tests {
         };
         let identity = AuthenticatedIdentity::Oidc(oidc);
 
-        let principal = builder.build_principal(&identity, &[]);
+        let principal = builder.build_principal(&identity);
 
         match principal {
-            CedarPrincipal::Human(human) => {
-                assert_eq!(human.email, "user@example.com");
-                assert_eq!(human.idp_prefix, "custom");
-                assert!(human.groups.is_empty());
+            CedarPrincipal::Oidc(entity) => {
+                assert_eq!(entity.email, "user@example.com");
+                assert_eq!(entity.idp_prefix, "custom");
+                assert!(entity.groups.is_empty());
             }
-            _ => panic!("Expected CedarPrincipal::Human"),
+            _ => panic!("Expected CedarPrincipal::Oidc"),
         }
     }
 
     #[test]
     fn test_build_aws_role_entity() {
-        let builder = MultiSourceEntityBuilder::new(EntityBuilder::new());
+        let builder = MultiSourceEntityBuilder::new();
         let aws = make_aws_identity();
         let identity = AuthenticatedIdentity::AwsSts(aws.clone());
 
-        let principal = builder.build_principal(&identity, &[]);
+        let principal = builder.build_principal(&identity);
 
         match principal {
             CedarPrincipal::AwsRole(role) => {
@@ -512,11 +517,11 @@ mod tests {
 
     #[test]
     fn test_build_gcp_entity() {
-        let builder = MultiSourceEntityBuilder::new(EntityBuilder::new());
+        let builder = MultiSourceEntityBuilder::new();
         let gcp = make_gcp_identity();
         let identity = AuthenticatedIdentity::Gcp(gcp.clone());
 
-        let principal = builder.build_principal(&identity, &[]);
+        let principal = builder.build_principal(&identity);
 
         match principal {
             CedarPrincipal::GcpWorkload(gcp_entity) => {
@@ -528,30 +533,6 @@ mod tests {
                 assert_eq!(gcp_entity.zone, "us-central1-a");
             }
             _ => panic!("Expected CedarPrincipal::GcpWorkload"),
-        }
-    }
-
-    #[test]
-    fn test_build_spire_entity_delegates_to_entity_builder() {
-        let builder = MultiSourceEntityBuilder::new(EntityBuilder::new());
-        let spire = make_spire_identity();
-        let identity = AuthenticatedIdentity::Spire(spire.clone());
-        let selectors = vec!["k8s:ns:finance".to_string(), "k8s:sa:payments-sa".to_string()];
-
-        let principal = builder.build_principal(&identity, &selectors);
-
-        match principal {
-            CedarPrincipal::Workload(workload) => {
-                assert_eq!(
-                    workload.spiffe_id,
-                    "spiffe://example.com/ns/finance/workload/payments"
-                );
-                assert_eq!(workload.trust_domain, "example.com");
-                assert_eq!(workload.environment, "production");
-                assert_eq!(workload.region, "us-east-1");
-                assert_eq!(workload.selectors, selectors);
-            }
-            _ => panic!("Expected CedarPrincipal::Workload"),
         }
     }
 
@@ -592,17 +573,20 @@ mod tests {
     }
 
     #[test]
-    fn test_build_cedar_entity_human() {
-        let human = HumanEntity {
+    fn test_build_cedar_entity_oidc() {
+        let oidc = OidcEntity {
             email: "alice@example.com".to_string(),
             idp_prefix: "okta".to_string(),
+            subject: "sub-123".to_string(),
+            subject_type: "human".to_string(),
             groups: vec!["eng".to_string(), "ops".to_string()],
+            claims: vec!["groups:eng".to_string(), "groups:ops".to_string()],
         };
 
-        let entity = build_cedar_entity(&CedarPrincipal::Human(human)).unwrap();
+        let entity = build_cedar_entity(&CedarPrincipal::Oidc(oidc)).unwrap();
         // Verify entity UID
         let uid = entity.uid();
-        assert!(uid.to_string().contains("HumanIdentity"));
+        assert!(uid.to_string().contains("OidcIdentity"));
         assert!(uid.to_string().contains("alice@example.com"));
     }
 
@@ -636,44 +620,18 @@ mod tests {
     }
 
     #[test]
-    fn test_build_cedar_entity_workload_returns_error() {
-        let workload = WorkloadEntity {
-            entity_type: crate::cedar::PlatformType::Base,
-            spiffe_id: "spiffe://test/workload".to_string(),
-            trust_domain: "test".to_string(),
-            environment: "dev".to_string(),
-            region: "local".to_string(),
-            selectors: vec![],
-            namespace: None,
-            service_account: None,
-            pod_labels: vec![],
-            container_name: None,
-            node_name: None,
-            instance_id: None,
-            account_id: None,
-            ami_id: None,
-            instance_tags: vec![],
-            security_groups: vec![],
-            project_id: None,
-            zone: None,
-            service_account_email: None,
-            instance_name: None,
-        };
-
-        let result = build_cedar_entity(&CedarPrincipal::Workload(workload));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_principal_entity_uid_human() {
-        let human = HumanEntity {
+    fn test_principal_entity_uid_oidc() {
+        let oidc = OidcEntity {
             email: "test@example.com".to_string(),
             idp_prefix: "azure".to_string(),
+            subject: "sub-1".to_string(),
+            subject_type: "human".to_string(),
             groups: vec![],
+            claims: vec![],
         };
 
-        let uid = principal_entity_uid(&CedarPrincipal::Human(human)).unwrap();
-        assert!(uid.to_string().contains("HumanIdentity"));
+        let uid = principal_entity_uid(&CedarPrincipal::Oidc(oidc)).unwrap();
+        assert!(uid.to_string().contains("OidcIdentity"));
         assert!(uid.to_string().contains("test@example.com"));
     }
 

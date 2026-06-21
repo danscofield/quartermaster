@@ -12,54 +12,7 @@ use tokio::sync::RwLock;
 
 use crate::sync::PolicySyncService;
 
-/// PlatformType identifies the workload platform for entity type selection.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PlatformType {
-    /// Base Workload — no platform-specific selectors detected.
-    Base,
-    /// K8sWorkload — Kubernetes workload attestor selectors detected.
-    K8s,
-    /// Ec2Workload — AWS IID attestor selectors detected.
-    Ec2,
-    /// GcpWorkload — GCP IIT attestor selectors detected.
-    Gcp,
-}
 
-/// WorkloadEntity represents an ephemeral Quartermaster workload entity for local Cedar evaluation.
-/// Constructed fresh at authorization-time from SVID claims and SPIRE selectors.
-/// Never persisted.
-#[derive(Debug, Clone)]
-pub struct WorkloadEntity {
-    /// The detected platform type determining the Cedar entity type.
-    pub entity_type: PlatformType,
-
-    // Common attributes (present on all entity types)
-    pub spiffe_id: String,
-    pub trust_domain: String,
-    pub environment: String,
-    pub region: String,
-    pub selectors: Vec<String>,
-
-    // K8s-specific attributes
-    pub namespace: Option<String>,
-    pub service_account: Option<String>,
-    pub pod_labels: Vec<String>,
-    pub container_name: Option<String>,
-    pub node_name: Option<String>,
-
-    // EC2-specific attributes
-    pub instance_id: Option<String>,
-    pub account_id: Option<String>,
-    pub ami_id: Option<String>,
-    pub instance_tags: Vec<String>,
-    pub security_groups: Vec<String>,
-
-    // GCP-specific attributes
-    pub project_id: Option<String>,
-    pub zone: Option<String>,
-    pub service_account_email: Option<String>,
-    pub instance_name: Option<String>,
-}
 
 /// AuthzDecision represents a single authorization decision from local Cedar evaluation.
 #[derive(Debug, Clone)]
@@ -69,11 +22,11 @@ pub struct AuthzDecision {
 }
 
 /// EntityBatchAuthzRequest contains parameters for a batch authorization evaluation
-/// using pre-built Cedar entities. Supports any principal type (HumanIdentity,
+/// using pre-built Cedar entities. Supports any principal type (OidcIdentity,
 /// AwsRoleIdentity, GcpIdentity, etc.) for the `assumeBillet` action.
 #[derive(Debug, Clone)]
 pub struct EntityBatchAuthzRequest {
-    /// The principal entity UID string (e.g., "Quartermaster::HumanIdentity::\"alice@example.com\"")
+    /// The principal entity UID string (e.g., "Quartermaster::OidcIdentity::\"alice@example.com\"")
     pub principal_type: String,
     /// The principal entity ID (used for constructing the entity UID)
     pub principal_id: String,
@@ -128,7 +81,7 @@ impl std::error::Error for CedarError {}
 #[async_trait::async_trait]
 pub trait LocalAuthorizer: Send + Sync {
     /// Evaluates multiple authorization requests using pre-built Cedar entities.
-    /// Supports any principal type (HumanIdentity, AwsRoleIdentity, GcpIdentity)
+    /// Supports any principal type (OidcIdentity, AwsRoleIdentity, GcpIdentity)
     /// for the `assumeBillet` action.
     async fn batch_is_authorized_entity(
         &self,
@@ -513,11 +466,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_batch_entity_allow_human_identity() {
-        // Policy that allows HumanIdentity principals to assumeBillet
+    async fn test_batch_entity_allow_oidc_identity() {
+        // Policy that allows OidcIdentity principals to assumeBillet
         let policy_str = r#"
             permit(
-                principal is Quartermaster::HumanIdentity,
+                principal is Quartermaster::OidcIdentity,
                 action == Quartermaster::Action::"assumeBillet",
                 resource
             );
@@ -526,8 +479,8 @@ mod tests {
         let shared = Arc::new(RwLock::new(Some(policy_set)));
         let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
-        // Build a HumanIdentity entity
-        let principal_uid = make_entity_uid("HumanIdentity", "alice@example.com").unwrap();
+        // Build an OidcIdentity entity
+        let principal_uid = make_entity_uid("OidcIdentity", "alice@example.com").unwrap();
         let mut attrs: HashMap<String, RestrictedExpression> = HashMap::new();
         attrs.insert(
             "email".to_string(),
@@ -538,15 +491,27 @@ mod tests {
             RestrictedExpression::new_string("okta".to_string()),
         );
         attrs.insert(
+            "subject".to_string(),
+            RestrictedExpression::new_string("alice@example.com".to_string()),
+        );
+        attrs.insert(
+            "subject_type".to_string(),
+            RestrictedExpression::new_string("human".to_string()),
+        );
+        attrs.insert(
             "groups".to_string(),
             string_set_expr(&["engineering".to_string(), "billing-ops".to_string()]),
         );
-        let human_entity = Entity::new(principal_uid, attrs, HashSet::new()).unwrap();
+        attrs.insert(
+            "claims".to_string(),
+            string_set_expr(&["groups:engineering".to_string(), "groups:billing-ops".to_string()]),
+        );
+        let oidc_entity = Entity::new(principal_uid, attrs, HashSet::new()).unwrap();
 
         let req = EntityBatchAuthzRequest {
-            principal_type: "HumanIdentity".to_string(),
+            principal_type: "OidcIdentity".to_string(),
             principal_id: "alice@example.com".to_string(),
-            principal_entities: vec![human_entity],
+            principal_entities: vec![oidc_entity],
             action: "assumeBillet".to_string(),
             resources: vec!["billing-writer".to_string()],
             context: CommonContext {
@@ -690,7 +655,7 @@ mod tests {
         let shared = Arc::new(RwLock::new(Some(policy_set)));
         let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
-        let principal_uid = make_entity_uid("HumanIdentity", "bob@example.com").unwrap();
+        let principal_uid = make_entity_uid("OidcIdentity", "bob@example.com").unwrap();
         let mut attrs: HashMap<String, RestrictedExpression> = HashMap::new();
         attrs.insert(
             "email".to_string(),
@@ -700,13 +665,22 @@ mod tests {
             "idp_prefix".to_string(),
             RestrictedExpression::new_string("azure".to_string()),
         );
+        attrs.insert(
+            "subject".to_string(),
+            RestrictedExpression::new_string("bob@example.com".to_string()),
+        );
+        attrs.insert(
+            "subject_type".to_string(),
+            RestrictedExpression::new_string("human".to_string()),
+        );
         attrs.insert("groups".to_string(), string_set_expr(&[]));
-        let human_entity = Entity::new(principal_uid, attrs, HashSet::new()).unwrap();
+        attrs.insert("claims".to_string(), string_set_expr(&[]));
+        let oidc_entity = Entity::new(principal_uid, attrs, HashSet::new()).unwrap();
 
         let req = EntityBatchAuthzRequest {
-            principal_type: "HumanIdentity".to_string(),
+            principal_type: "OidcIdentity".to_string(),
             principal_id: "bob@example.com".to_string(),
-            principal_entities: vec![human_entity],
+            principal_entities: vec![oidc_entity],
             action: "assumeBillet".to_string(),
             resources: vec!["secret-billet".to_string()],
             context: CommonContext {
@@ -729,13 +703,13 @@ mod tests {
         let shared = Arc::new(RwLock::new(None));
         let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
-        let principal_uid = make_entity_uid("HumanIdentity", "test@test.com").unwrap();
-        let human_entity = Entity::new_no_attrs(principal_uid, HashSet::new());
+        let principal_uid = make_entity_uid("OidcIdentity", "test@test.com").unwrap();
+        let oidc_entity = Entity::new_no_attrs(principal_uid, HashSet::new());
 
         let req = EntityBatchAuthzRequest {
-            principal_type: "HumanIdentity".to_string(),
+            principal_type: "OidcIdentity".to_string(),
             principal_id: "test@test.com".to_string(),
-            principal_entities: vec![human_entity],
+            principal_entities: vec![oidc_entity],
             action: "assumeBillet".to_string(),
             resources: vec!["any-billet".to_string()],
             context: CommonContext {
@@ -768,7 +742,7 @@ mod tests {
         let shared = Arc::new(RwLock::new(Some(policy_set)));
         let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
 
-        let principal_uid = make_entity_uid("HumanIdentity", "user@example.com").unwrap();
+        let principal_uid = make_entity_uid("OidcIdentity", "user@example.com").unwrap();
         let mut attrs: HashMap<String, RestrictedExpression> = HashMap::new();
         attrs.insert(
             "email".to_string(),
@@ -778,14 +752,23 @@ mod tests {
             "idp_prefix".to_string(),
             RestrictedExpression::new_string("okta".to_string()),
         );
+        attrs.insert(
+            "subject".to_string(),
+            RestrictedExpression::new_string("user@example.com".to_string()),
+        );
+        attrs.insert(
+            "subject_type".to_string(),
+            RestrictedExpression::new_string("human".to_string()),
+        );
         attrs.insert("groups".to_string(), string_set_expr(&[]));
-        let human_entity = Entity::new(principal_uid, attrs, HashSet::new()).unwrap();
+        attrs.insert("claims".to_string(), string_set_expr(&[]));
+        let oidc_entity = Entity::new(principal_uid, attrs, HashSet::new()).unwrap();
 
         // Request with source_type = "oidc" — should be allowed
         let req = EntityBatchAuthzRequest {
-            principal_type: "HumanIdentity".to_string(),
+            principal_type: "OidcIdentity".to_string(),
             principal_id: "user@example.com".to_string(),
-            principal_entities: vec![human_entity.clone()],
+            principal_entities: vec![oidc_entity.clone()],
             action: "assumeBillet".to_string(),
             resources: vec!["test-billet".to_string()],
             context: CommonContext {
@@ -803,9 +786,9 @@ mod tests {
 
         // Request with source_type = "spire" — should be denied by the condition
         let req2 = EntityBatchAuthzRequest {
-            principal_type: "HumanIdentity".to_string(),
+            principal_type: "OidcIdentity".to_string(),
             principal_id: "user@example.com".to_string(),
-            principal_entities: vec![human_entity],
+            principal_entities: vec![oidc_entity],
             action: "assumeBillet".to_string(),
             resources: vec!["test-billet".to_string()],
             context: CommonContext {

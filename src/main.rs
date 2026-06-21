@@ -10,7 +10,6 @@ use quartermaster::domain::admin::billets::BilletCrudService;
 use quartermaster::domain::admin::policies::PolicyCrudService;
 use quartermaster::domain::audit::config::build_sinks;
 use quartermaster::domain::audit::AuditService;
-use quartermaster::domain::billet::entity_builder::EntityBuilder;
 use quartermaster::domain::billet::BilletResolverImpl;
 use quartermaster::config::CacheBackend;
 use quartermaster::domain::cache::memory::InMemoryCache;
@@ -421,7 +420,7 @@ async fn main() {
         ));
 
     // Initialize MultiSourceEntityBuilder
-    let multi_source_entity_builder = Arc::new(MultiSourceEntityBuilder::new(EntityBuilder::new()));
+    let multi_source_entity_builder = Arc::new(MultiSourceEntityBuilder::new());
 
     // Initialize ImplicitBilletMapper from OIDC sources (if configured)
     let implicit_billet_mapper = if let Some(ref identity_config) = config.identity {
