@@ -141,10 +141,6 @@ trust_domain = "example.com"
 # Path or URL to SPIRE's JWKS for SVID signature verification.
 jwks_path = "/run/spire/agent/jwks.json"
 
-# SPIRE Server API address for selector enrichment.
-# If omitted, selector enrichment is disabled (empty selectors passed to Cedar).
-server_addr = "unix:///run/spire/server/api.sock"
-
 # Expected audience in SVIDs presented to Quartermaster.
 audience = "quartermaster.example.com"
 
@@ -408,7 +404,6 @@ region = "us-east-1"
 [identity.spire]
 trust_domain = "example.com"
 jwks_path = "/run/spire/agent/jwks.json"
-server_addr = "unix:///run/spire/server/api.sock"
 audience = "quartermaster.example.com"
 
 [[identity.oidc]]
@@ -488,7 +483,6 @@ key_name = "projects/my-prod-project/locations/global/keyRings/quartermaster/cry
 [identity.spire]
 trust_domain = "example.com"
 jwks_path = "/run/spire/agent/jwks.json"
-server_addr = "unix:///run/spire/server/api.sock"
 audience = "quartermaster.example.com"
 
 [[identity.oidc]]

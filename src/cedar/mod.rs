@@ -68,15 +68,6 @@ pub struct AuthzDecision {
     pub decision: Decision,
 }
 
-/// BatchAuthzRequest contains the parameters for a batch authorization evaluation.
-#[derive(Debug, Clone)]
-pub struct BatchAuthzRequest {
-    pub principal: WorkloadEntity,
-    pub action: String,
-    pub resources: Vec<String>,
-    pub context: CommonContext,
-}
-
 /// EntityBatchAuthzRequest contains parameters for a batch authorization evaluation
 /// using pre-built Cedar entities. Supports any principal type (HumanIdentity,
 /// AwsRoleIdentity, GcpIdentity, etc.) for the `assumeBillet` action.
@@ -136,13 +127,6 @@ impl std::error::Error for CedarError {}
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait LocalAuthorizer: Send + Sync {
-    /// Evaluates multiple authorization requests for workload billet assumption.
-    async fn batch_is_authorized(
-        &self,
-        req: BatchAuthzRequest,
-        billet_tags: &HashMap<String, Vec<String>>,
-    ) -> Result<Vec<AuthzDecision>, CedarError>;
-
     /// Evaluates multiple authorization requests using pre-built Cedar entities.
     /// Supports any principal type (HumanIdentity, AwsRoleIdentity, GcpIdentity)
     /// for the `assumeBillet` action.
@@ -200,16 +184,6 @@ impl CedarAuthorizer {
 /// Namespace for all Quartermaster Cedar entity types.
 const NAMESPACE: &str = "Quartermaster";
 
-/// Maps a PlatformType to the Cedar entity type name string.
-fn platform_entity_type_name(platform: &PlatformType) -> &'static str {
-    match platform {
-        PlatformType::Base => "Workload",
-        PlatformType::K8s => "K8sWorkload",
-        PlatformType::Ec2 => "Ec2Workload",
-        PlatformType::Gcp => "GcpWorkload",
-    }
-}
-
 /// Constructs a Cedar EntityUid for a given entity type and ID within the Quartermaster namespace.
 fn make_entity_uid(entity_type: &str, id: &str) -> Result<EntityUid, CedarError> {
     let type_name = EntityTypeName::from_str(&format!("{NAMESPACE}::{entity_type}"))
@@ -248,139 +222,6 @@ fn build_context(ctx: &CommonContext) -> Result<Context, CedarError> {
 
     Context::from_pairs(pairs)
         .map_err(|e| CedarError::EvaluationFailed(format!("Failed to build context: {e}")))
-}
-
-/// Builds the Cedar Entity for the workload principal, including parent hierarchy.
-/// Returns the entities needed for the principal side (platform-specific + base Workload parent).
-fn build_workload_entities(workload: &WorkloadEntity) -> Result<Vec<Entity>, CedarError> {
-    let platform_type_name = platform_entity_type_name(&workload.entity_type);
-    let principal_uid = make_entity_uid(platform_type_name, &workload.spiffe_id)?;
-
-    // Build attributes for the workload entity
-    let mut attrs: HashMap<String, RestrictedExpression> = HashMap::new();
-    attrs.insert(
-        "spiffe_id".to_string(),
-        RestrictedExpression::new_string(workload.spiffe_id.clone()),
-    );
-    attrs.insert(
-        "trust_domain".to_string(),
-        RestrictedExpression::new_string(workload.trust_domain.clone()),
-    );
-    attrs.insert(
-        "environment".to_string(),
-        RestrictedExpression::new_string(workload.environment.clone()),
-    );
-    attrs.insert(
-        "region".to_string(),
-        RestrictedExpression::new_string(workload.region.clone()),
-    );
-    attrs.insert("selectors".to_string(), string_set_expr(&workload.selectors));
-
-    // Add platform-specific attributes
-    match workload.entity_type {
-        PlatformType::K8s => {
-            attrs.insert(
-                "namespace".to_string(),
-                RestrictedExpression::new_string(
-                    workload.namespace.clone().unwrap_or_default(),
-                ),
-            );
-            attrs.insert(
-                "service_account".to_string(),
-                RestrictedExpression::new_string(
-                    workload.service_account.clone().unwrap_or_default(),
-                ),
-            );
-            attrs.insert("pod_labels".to_string(), string_set_expr(&workload.pod_labels));
-            attrs.insert(
-                "container_name".to_string(),
-                RestrictedExpression::new_string(
-                    workload.container_name.clone().unwrap_or_default(),
-                ),
-            );
-            attrs.insert(
-                "node_name".to_string(),
-                RestrictedExpression::new_string(
-                    workload.node_name.clone().unwrap_or_default(),
-                ),
-            );
-        }
-        PlatformType::Ec2 => {
-            attrs.insert(
-                "instance_id".to_string(),
-                RestrictedExpression::new_string(
-                    workload.instance_id.clone().unwrap_or_default(),
-                ),
-            );
-            attrs.insert(
-                "account_id".to_string(),
-                RestrictedExpression::new_string(
-                    workload.account_id.clone().unwrap_or_default(),
-                ),
-            );
-            attrs.insert(
-                "ami_id".to_string(),
-                RestrictedExpression::new_string(workload.ami_id.clone().unwrap_or_default()),
-            );
-            attrs.insert("instance_tags".to_string(), string_set_expr(&workload.instance_tags));
-            attrs.insert(
-                "security_groups".to_string(),
-                string_set_expr(&workload.security_groups),
-            );
-        }
-        PlatformType::Gcp => {
-            attrs.insert(
-                "project_id".to_string(),
-                RestrictedExpression::new_string(
-                    workload.project_id.clone().unwrap_or_default(),
-                ),
-            );
-            attrs.insert(
-                "zone".to_string(),
-                RestrictedExpression::new_string(workload.zone.clone().unwrap_or_default()),
-            );
-            attrs.insert(
-                "service_account_email".to_string(),
-                RestrictedExpression::new_string(
-                    workload.service_account_email.clone().unwrap_or_default(),
-                ),
-            );
-            attrs.insert(
-                "instance_name".to_string(),
-                RestrictedExpression::new_string(
-                    workload.instance_name.clone().unwrap_or_default(),
-                ),
-            );
-        }
-        PlatformType::Base => {
-            // Base Workload has only common attributes (already added above)
-        }
-    }
-
-    let mut entities = Vec::new();
-
-    // If this is a platform-specific workload, register parent hierarchy
-    if workload.entity_type != PlatformType::Base {
-        // Create the base Workload parent entity (bare, no attrs needed for hierarchy)
-        let parent_uid = make_entity_uid("Workload", &workload.spiffe_id)?;
-        let parent_entity = Entity::new_no_attrs(parent_uid.clone(), HashSet::new());
-        entities.push(parent_entity);
-
-        // Create the platform-specific entity with parent reference
-        let parents: HashSet<EntityUid> = HashSet::from([parent_uid]);
-        let principal_entity = Entity::new(principal_uid, attrs, parents).map_err(|e| {
-            CedarError::EvaluationFailed(format!("Failed to create principal entity: {e}"))
-        })?;
-        entities.push(principal_entity);
-    } else {
-        // Base Workload — no parent
-        let principal_entity = Entity::new(principal_uid, attrs, HashSet::new()).map_err(|e| {
-            CedarError::EvaluationFailed(format!("Failed to create principal entity: {e}"))
-        })?;
-        entities.push(principal_entity);
-    }
-
-    Ok(entities)
 }
 
 /// Builds Cedar entities for a workload authenticated via path pattern extraction.
@@ -424,73 +265,6 @@ pub fn build_workload_entities_from_captures(
 
 #[async_trait::async_trait]
 impl LocalAuthorizer for CedarAuthorizer {
-    async fn batch_is_authorized(
-        &self,
-        req: BatchAuthzRequest,
-        billet_tags: &HashMap<String, Vec<String>>,
-    ) -> Result<Vec<AuthzDecision>, CedarError> {
-        // Resolve billet tags from PolicySyncService (or use caller-provided tags for testing)
-        let resource_names: Vec<&str> = req.resources.iter().map(|s| s.as_str()).collect();
-        let resolved_tags = self.resolve_billet_tags(billet_tags, &resource_names).await;
-
-        // Acquire read lock on PolicySet
-        let policy_set_guard = self.policy_set.read().await;
-        let policy_set = policy_set_guard
-            .as_ref()
-            .ok_or(CedarError::PolicySetNotInitialized)?;
-
-        let authorizer = Authorizer::new();
-        let platform_type_name = platform_entity_type_name(&req.principal.entity_type);
-        let principal_uid = make_entity_uid(platform_type_name, &req.principal.spiffe_id)?;
-        let action_uid = make_entity_uid("Action", &req.action)?;
-
-        // Build workload entities once (shared across all resource evaluations)
-        let workload_entities = build_workload_entities(&req.principal)?;
-
-        let mut decisions = Vec::with_capacity(req.resources.len());
-
-        for resource_name in &req.resources {
-            // Construct the billet resource entity with tags
-            let empty_tags = vec![];
-            let tags = resolved_tags.get(resource_name.as_str()).unwrap_or(&empty_tags);
-            let billet_entity = build_billet_entity(resource_name, tags)?;
-            let resource_uid = make_entity_uid("Billet", resource_name)?;
-
-            // Combine workload entities + billet entity into Entities set
-            let mut all_entities: Vec<Entity> = workload_entities.clone();
-            all_entities.push(billet_entity);
-
-            let entities = Entities::from_entities(all_entities, None).map_err(|e| {
-                CedarError::EvaluationFailed(format!("Failed to build entities: {e}"))
-            })?;
-
-            // Build context
-            let context = build_context(&req.context)?;
-
-            // Construct the Cedar Request
-            let request = Request::new(
-                principal_uid.clone(),
-                action_uid.clone(),
-                resource_uid,
-                context,
-                None, // No schema validation on request
-            )
-            .map_err(|e| {
-                CedarError::EvaluationFailed(format!("Failed to build request: {e}"))
-            })?;
-
-            // Evaluate
-            let response = authorizer.is_authorized(&request, policy_set, &entities);
-
-            decisions.push(AuthzDecision {
-                resource: resource_name.clone(),
-                decision: response.decision(),
-            });
-        }
-
-        Ok(decisions)
-    }
-
     async fn batch_is_authorized_entity(
         &self,
         req: EntityBatchAuthzRequest,
@@ -651,47 +425,6 @@ mod tests {
         }
     }
 
-    fn make_workload_entity() -> WorkloadEntity {
-        WorkloadEntity {
-            entity_type: PlatformType::K8s,
-            spiffe_id: "spiffe://example.com/ns/finance/workload/payments".to_string(),
-            trust_domain: "example.com".to_string(),
-            environment: "production".to_string(),
-            region: "us-east-1".to_string(),
-            selectors: vec!["k8s:ns:finance".to_string(), "k8s:sa:payments-sa".to_string()],
-            namespace: Some("finance".to_string()),
-            service_account: Some("payments-sa".to_string()),
-            pod_labels: vec!["project:payments".to_string()],
-            container_name: Some("main".to_string()),
-            node_name: Some("node-1".to_string()),
-            instance_id: None,
-            account_id: None,
-            ami_id: None,
-            instance_tags: vec![],
-            security_groups: vec![],
-            project_id: None,
-            zone: None,
-            service_account_email: None,
-            instance_name: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_policy_set_not_initialized() {
-        let policy_set = Arc::new(RwLock::new(None));
-        let authorizer = CedarAuthorizer::new(policy_set, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
-
-        let req = BatchAuthzRequest {
-            principal: make_workload_entity(),
-            action: "assumeBillet".to_string(),
-            resources: vec!["test-billet".to_string()],
-            context: make_common_context(),
-        };
-
-        let result = authorizer.batch_is_authorized(req, &HashMap::new()).await;
-        assert!(matches!(result, Err(CedarError::PolicySetNotInitialized)));
-    }
-
     #[tokio::test]
     async fn test_admin_policy_set_not_initialized() {
         let policy_set = Arc::new(RwLock::new(None));
@@ -709,26 +442,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_batch_deny_with_empty_policy_set() {
-        // An empty PolicySet should deny all requests
-        let policy_set = PolicySet::new();
-        let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
-
-        let req = BatchAuthzRequest {
-            principal: make_workload_entity(),
-            action: "assumeBillet".to_string(),
-            resources: vec!["billet-a".to_string(), "billet-b".to_string()],
-            context: make_common_context(),
-        };
-
-        let result = authorizer.batch_is_authorized(req, &HashMap::new()).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].decision, Decision::Deny);
-        assert_eq!(result[1].decision, Decision::Deny);
-    }
-
-    #[tokio::test]
     async fn test_admin_deny_with_empty_policy_set() {
         let policy_set = PolicySet::new();
         let shared = Arc::new(RwLock::new(Some(policy_set)));
@@ -743,35 +456,6 @@ mod tests {
 
         let result = authorizer.is_authorized_admin(req, &HashMap::new()).await.unwrap();
         assert!(!result);
-    }
-
-    #[tokio::test]
-    async fn test_batch_allow_with_permit_policy() {
-        // Create a policy that permits all principals to assumeBillet on any resource
-        let policy_str = r#"
-            permit(
-                principal,
-                action == Quartermaster::Action::"assumeBillet",
-                resource
-            );
-        "#;
-        let policy_set = policy_str.parse::<PolicySet>().unwrap();
-        let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
-
-        let req = BatchAuthzRequest {
-            principal: make_workload_entity(),
-            action: "assumeBillet".to_string(),
-            resources: vec!["billet-a".to_string(), "billet-b".to_string()],
-            context: make_common_context(),
-        };
-
-        let result = authorizer.batch_is_authorized(req, &HashMap::new()).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].resource, "billet-a");
-        assert_eq!(result[0].decision, Decision::Allow);
-        assert_eq!(result[1].resource, "billet-b");
-        assert_eq!(result[1].decision, Decision::Allow);
     }
 
     #[tokio::test]
@@ -826,55 +510,6 @@ mod tests {
 
         let result = authorizer.is_authorized_admin(req, &HashMap::new()).await.unwrap();
         assert!(result);
-    }
-
-    #[tokio::test]
-    async fn test_base_workload_entity_no_parent() {
-        // Test that a base Workload (no platform) works correctly
-        let policy_str = r#"
-            permit(
-                principal,
-                action == Quartermaster::Action::"assumeBillet",
-                resource
-            );
-        "#;
-        let policy_set = policy_str.parse::<PolicySet>().unwrap();
-        let shared = Arc::new(RwLock::new(Some(policy_set)));
-        let authorizer = CedarAuthorizer::new(shared, test_policy_sync(), vec!["quartermaster-admin".to_string(), "quartermaster-guardrails".to_string()]);
-
-        let workload = WorkloadEntity {
-            entity_type: PlatformType::Base,
-            spiffe_id: "spiffe://example.com/workload/generic".to_string(),
-            trust_domain: "example.com".to_string(),
-            environment: "staging".to_string(),
-            region: "eu-west-1".to_string(),
-            selectors: vec![],
-            namespace: None,
-            service_account: None,
-            pod_labels: vec![],
-            container_name: None,
-            node_name: None,
-            instance_id: None,
-            account_id: None,
-            ami_id: None,
-            instance_tags: vec![],
-            security_groups: vec![],
-            project_id: None,
-            zone: None,
-            service_account_email: None,
-            instance_name: None,
-        };
-
-        let req = BatchAuthzRequest {
-            principal: workload,
-            action: "assumeBillet".to_string(),
-            resources: vec!["test-billet".to_string()],
-            context: make_common_context(),
-        };
-
-        let result = authorizer.batch_is_authorized(req, &HashMap::new()).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].decision, Decision::Allow);
     }
 
     #[tokio::test]

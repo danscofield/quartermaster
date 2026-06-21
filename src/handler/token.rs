@@ -389,7 +389,6 @@ fn build_resolver_input(
             audience: audience.to_string(),
             request_time: chrono::Utc::now(),
             source_cloud: String::new(),
-            selectors: vec![],
         },
         AuthenticatedIdentity::AwsSts(_) => ResolverInput {
             spiffe_id: subject.to_string(),
@@ -399,7 +398,6 @@ fn build_resolver_input(
             audience: audience.to_string(),
             request_time: chrono::Utc::now(),
             source_cloud: "aws".to_string(),
-            selectors: vec![],
         },
         AuthenticatedIdentity::Gcp(_) => ResolverInput {
             spiffe_id: subject.to_string(),
@@ -409,7 +407,6 @@ fn build_resolver_input(
             audience: audience.to_string(),
             request_time: chrono::Utc::now(),
             source_cloud: "gcp".to_string(),
-            selectors: vec![],
         },
         AuthenticatedIdentity::Oidc(_) => ResolverInput {
             spiffe_id: subject.to_string(),
@@ -419,7 +416,6 @@ fn build_resolver_input(
             audience: audience.to_string(),
             request_time: chrono::Utc::now(),
             source_cloud: String::new(),
-            selectors: vec![],
         },
     }
 }

@@ -176,7 +176,6 @@ src/
   sync/            # PolicySyncService (background data refresh)
   signing/         # KeyManager implementations
   oidc/            # OIDC discovery document builder
-  spireapi/        # SPIRE Server API client
   config/          # Configuration loading
 ```
 

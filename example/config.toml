@@ -61,11 +61,9 @@ type = "stdout"
 # [identity.spire]
 # trust_domain = "example.com"
 # jwks_path = "/run/spire/agent/jwks.json"
-# server_addr = "unix:///run/spire/server/api.sock"
 # audience = "quartermaster.example.com"
 
 # Path patterns for extracting workload attributes from SPIFFE ID paths.
-# When configured, SPIRE Server API calls are skipped entirely.
 # Patterns are evaluated in order — first match wins.
 # Named capture groups become Cedar principal attributes (as String values).
 #

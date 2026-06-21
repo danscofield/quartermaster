@@ -32,10 +32,6 @@ pub struct SpireSourceConfig {
     /// Path to the SPIRE trust bundle (JWKS file) or URL
     pub jwks_path: String,
 
-    /// Optional SPIRE server address for selector enrichment
-    /// (e.g., "unix:///run/spire/server/api.sock")
-    pub server_addr: Option<String>,
-
     /// Expected audience in SVIDs
     pub audience: String,
 
@@ -454,7 +450,6 @@ mod tests {
 [spire]
 trust_domain = "example.com"
 jwks_path = "/run/spire/agent/jwks.json"
-server_addr = "unix:///run/spire/server/api.sock"
 audience = "quartermaster.example.com"
 
 [[oidc]]
@@ -498,10 +493,6 @@ max_staleness = "24h"
         let spire = config.spire.unwrap();
         assert_eq!(spire.trust_domain, "example.com");
         assert_eq!(spire.jwks_path, "/run/spire/agent/jwks.json");
-        assert_eq!(
-            spire.server_addr.as_deref(),
-            Some("unix:///run/spire/server/api.sock")
-        );
         assert_eq!(spire.audience, "quartermaster.example.com");
 
         // OIDC sources
@@ -566,9 +557,6 @@ audience = "qm.example.com"
         assert!(config.oidc.is_empty());
         assert!(config.aws_sts.is_none());
         assert!(config.gcp.is_none());
-
-        // server_addr is optional
-        assert!(config.spire.unwrap().server_addr.is_none());
     }
 
     #[test]
@@ -699,7 +687,6 @@ billet_prefix = "okta-group"
             spire: Some(SpireSourceConfig {
                 trust_domain: "example.com".to_string(),
                 jwks_path: "/run/spire/bundle.json".to_string(),
-                server_addr: None,
                 audience: "qm.example.com".to_string(),
                 x509_bundle_path: None,
                 path_patterns: vec![],
@@ -1031,7 +1018,6 @@ billet_prefix = "okta-group"
             spire: Some(SpireSourceConfig {
                 trust_domain: "example.com".to_string(),
                 jwks_path: "/run/spire/bundle.json".to_string(),
-                server_addr: None,
                 audience: "qm.example.com".to_string(),
                 x509_bundle_path: None,
                 path_patterns: vec![],

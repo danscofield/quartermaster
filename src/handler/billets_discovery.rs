@@ -242,7 +242,6 @@ fn build_resolver_input(
             audience: String::new(),
             request_time: chrono::Utc::now(),
             source_cloud: String::new(),
-            selectors: vec![],
         },
         AuthenticatedIdentity::AwsSts(_) => crate::domain::billet::ResolverInput {
             spiffe_id: subject.to_string(),
@@ -252,7 +251,6 @@ fn build_resolver_input(
             audience: String::new(),
             request_time: chrono::Utc::now(),
             source_cloud: "aws".to_string(),
-            selectors: vec![],
         },
         AuthenticatedIdentity::Gcp(_) => crate::domain::billet::ResolverInput {
             spiffe_id: subject.to_string(),
@@ -262,7 +260,6 @@ fn build_resolver_input(
             audience: String::new(),
             request_time: chrono::Utc::now(),
             source_cloud: "gcp".to_string(),
-            selectors: vec![],
         },
         AuthenticatedIdentity::Oidc(_) => crate::domain::billet::ResolverInput {
             spiffe_id: subject.to_string(),
@@ -272,7 +269,6 @@ fn build_resolver_input(
             audience: String::new(),
             request_time: chrono::Utc::now(),
             source_cloud: String::new(),
-            selectors: vec![],
         },
     }
 }
