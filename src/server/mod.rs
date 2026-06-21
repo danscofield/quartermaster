@@ -22,6 +22,7 @@ use crate::domain::identity::entity::MultiSourceEntityBuilder;
 use crate::domain::identity::implicit::ImplicitBilletMapper;
 use crate::domain::identity::jwks::JwksManager;
 use crate::domain::identity::mtls::MtlsValidator;
+use crate::domain::identity::path_pattern::PathPatternMatcher;
 use crate::domain::ratelimit::Limiter;
 use crate::domain::token::Issuer;
 use crate::keymanager::KeyManager;
@@ -65,6 +66,10 @@ pub struct AppState {
     /// - `[identity.spire].x509_bundle_path` is absent, OR
     /// - `[server.tls]` is absent
     pub mtls_validator: Option<Arc<MtlsValidator>>,
+    /// Path pattern matcher for extracting attributes from SPIFFE ID paths.
+    /// `Some` when `[[identity.spire.path_patterns]]` is configured (path-pattern mode).
+    /// `None` when using legacy SPIRE API enrichment or no-op mode.
+    pub path_pattern_matcher: Option<Arc<PathPatternMatcher>>,
 }
 
 /// Builds the data-plane router, conditionally including admin routes.

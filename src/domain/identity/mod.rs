@@ -7,6 +7,8 @@ pub mod implicit;
 pub mod jwks;
 pub mod mtls;
 pub mod oidc;
+pub mod path_pattern;
+pub mod selector_enricher;
 pub mod subject;
 
 use std::collections::HashMap;

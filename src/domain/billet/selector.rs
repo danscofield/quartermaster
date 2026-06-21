@@ -47,7 +47,27 @@ impl SpireSelectorEnricher {
 impl SelectorEnricher for SpireSelectorEnricher {
     async fn fetch_selectors(&self, spiffe_id: &str) -> Result<Vec<String>, SelectorError> {
         match self.client.list_entries_by_spiffe_id(spiffe_id).await {
-            Ok(Some(entry)) => Ok(entry.selectors),
+            Ok(Some(entry)) => {
+                let mut selectors = entry.selectors;
+
+                // Also fetch the parent (agent) entry's selectors for node-level metadata
+                // (e.g., gcp_iit:project-id, aws:iid:account-id)
+                if let Some(ref parent_id) = entry.parent_id {
+                    match self.client.list_entries_by_spiffe_id(parent_id).await {
+                        Ok(Some(parent_entry)) => {
+                            selectors.extend(parent_entry.selectors);
+                        }
+                        Ok(None) => {
+                            tracing::debug!("no SPIRE entry found for parent {}", parent_id);
+                        }
+                        Err(e) => {
+                            tracing::debug!("failed to fetch parent entry {}: {}", parent_id, e);
+                        }
+                    }
+                }
+
+                Ok(selectors)
+            }
             Ok(None) => {
                 tracing::warn!("no SPIRE entry found for {}", spiffe_id);
                 Ok(Vec::new())
@@ -84,12 +104,13 @@ mod tests {
             .withf(|id| id == "spiffe://example.org/workload")
             .returning(|_| {
                 Ok(Some(RegistrationEntry {
-                    spiffe_id: "spiffe://example.org/workload".to_string(),
-                    selectors: vec![
-                        "k8s:ns:finance".to_string(),
-                        "k8s:sa:payments-sa".to_string(),
-                    ],
-                }))
+                                    spiffe_id: "spiffe://example.org/workload".to_string(),
+                                    parent_id: None,
+                                    selectors: vec![
+                                        "k8s:ns:finance".to_string(),
+                                        "k8s:sa:payments-sa".to_string(),
+                                    ],
+                                }))
             });
 
         let enricher = SpireSelectorEnricher::new(Arc::new(mock_client));
@@ -174,9 +195,10 @@ mod tests {
             .expect_list_entries_by_spiffe_id()
             .returning(|_| {
                 Ok(Some(RegistrationEntry {
-                    spiffe_id: "spiffe://example.org/workload".to_string(),
-                    selectors: vec![],
-                }))
+                                    spiffe_id: "spiffe://example.org/workload".to_string(),
+                                    parent_id: None,
+                                    selectors: vec![],
+                                }))
             });
 
         let enricher = SpireSelectorEnricher::new(Arc::new(mock_client));

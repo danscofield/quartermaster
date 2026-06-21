@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use std::time::Duration;
 use url::Url;
 
+use crate::domain::identity::path_pattern::{PathPatternError, PathPatternMatcher};
+
 /// Top-level identity source configuration.
 /// At least one source must be configured.
 #[derive(Debug, Clone, Deserialize)]
@@ -42,6 +44,19 @@ pub struct SpireSourceConfig {
     /// Distinct from `jwks_path`, which provides JWT signing keys for JWT-SVID verification.
     /// When absent, mTLS identity source is disabled.
     pub x509_bundle_path: Option<String>,
+
+    /// Path patterns for extracting attributes from SPIFFE ID paths.
+    /// When non-empty, SPIRE Server API calls are skipped entirely.
+    #[serde(default)]
+    pub path_patterns: Vec<PathPatternConfig>,
+}
+
+/// A single SPIFFE ID path pattern with a regex containing named capture groups.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PathPatternConfig {
+    /// Regex pattern with named capture groups (e.g., `(?P<namespace>[^/]+)`).
+    /// Applied to the SPIFFE ID path (after stripping `spiffe://<trust_domain>`).
+    pub pattern: String,
 }
 
 /// Configuration for a single OIDC identity provider source.
@@ -276,6 +291,19 @@ impl IdentityConfig {
         }
 
         Ok(())
+    }
+}
+
+impl SpireSourceConfig {
+    /// Validates path patterns at startup.
+    /// Returns compiled PathPatternMatcher on success, or errors on failure.
+    pub fn validate_path_patterns(
+        &self,
+    ) -> Result<Option<PathPatternMatcher>, Vec<PathPatternError>> {
+        if self.path_patterns.is_empty() {
+            return Ok(None);
+        }
+        PathPatternMatcher::compile(&self.trust_domain, &self.path_patterns).map(Some)
     }
 }
 
@@ -674,6 +702,7 @@ billet_prefix = "okta-group"
                 server_addr: None,
                 audience: "qm.example.com".to_string(),
                 x509_bundle_path: None,
+                path_patterns: vec![],
             }),
             oidc: vec![],
             aws_sts: None,
@@ -1005,6 +1034,7 @@ billet_prefix = "okta-group"
                 server_addr: None,
                 audience: "qm.example.com".to_string(),
                 x509_bundle_path: None,
+                path_patterns: vec![],
             }),
             oidc: vec![source1, source2],
             aws_sts: Some(AwsStsSourceConfig {

@@ -64,6 +64,23 @@ type = "stdout"
 # server_addr = "unix:///run/spire/server/api.sock"
 # audience = "quartermaster.example.com"
 
+# Path patterns for extracting workload attributes from SPIFFE ID paths.
+# When configured, SPIRE Server API calls are skipped entirely.
+# Patterns are evaluated in order — first match wins.
+# Named capture groups become Cedar principal attributes (as String values).
+#
+# Example: Kubernetes-style hierarchical paths
+# [[identity.spire.path_patterns]]
+# pattern = "^/env/(?P<environment>[^/]+)/project/(?P<project>[^/]+)/ns/(?P<namespace>[^/]+)/sa/(?P<service_account>[^/]+)$"
+#
+# Example: Namespace/service-account/workload paths
+# [[identity.spire.path_patterns]]
+# pattern = "^/ns/(?P<namespace>[^/]+)/sa/(?P<service_account>[^/]+)/workload/(?P<workload>[^/]+)$"
+#
+# Example: Agent identity paths (catch-all — place last due to first-match-wins)
+# [[identity.spire.path_patterns]]
+# pattern = "^/agent/(?P<agent_type>[^/]+)/(?P<agent_id>.+)$"
+
 # --- OIDC identity sources (one or more) ---
 # [[identity.oidc]]
 # prefix = "okta"

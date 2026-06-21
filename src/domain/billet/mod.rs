@@ -10,8 +10,12 @@ use std::time::Duration;
 use cedar_policy::Decision;
 use tracing::{info, warn};
 
-use crate::cedar::{BatchAuthzRequest, CommonContext, LocalAuthorizer};
+use crate::cedar::{
+    BatchAuthzRequest, CommonContext, EntityBatchAuthzRequest, LocalAuthorizer,
+    build_workload_entities_from_captures,
+};
 use crate::domain::cache::{Cache, CacheError};
+use crate::domain::identity::path_pattern::PathPatternMatcher;
 use crate::sync::PolicySyncService;
 
 use self::entity_builder::{EntityBuilder, EntityBuilderInput};
@@ -79,6 +83,9 @@ pub struct BilletResolverImpl {
     cache: Arc<dyn Cache>,
     policy_sync: Arc<PolicySyncService>,
     cache_ttl: Duration,
+    /// When `Some`, use path-pattern extraction instead of selector enrichment + EntityBuilder.
+    /// The path-pattern path builds Cedar entities directly from regex captures.
+    path_pattern_matcher: Option<Arc<PathPatternMatcher>>,
 }
 
 impl BilletResolverImpl {
@@ -98,6 +105,30 @@ impl BilletResolverImpl {
             cache,
             policy_sync,
             cache_ttl,
+            path_pattern_matcher: None,
+        }
+    }
+
+    /// Creates a new BilletResolverImpl with path-pattern mode enabled.
+    /// When a `PathPatternMatcher` is provided, the resolver bypasses the selector enricher
+    /// and entity builder, instead using regex captures to build Cedar entities directly.
+    pub fn with_path_pattern_matcher(
+        selector_enricher: Arc<dyn SelectorEnricher>,
+        entity_builder: EntityBuilder,
+        authorizer: Arc<dyn LocalAuthorizer>,
+        cache: Arc<dyn Cache>,
+        policy_sync: Arc<PolicySyncService>,
+        cache_ttl: Duration,
+        path_pattern_matcher: Arc<PathPatternMatcher>,
+    ) -> Self {
+        Self {
+            selector_enricher,
+            entity_builder,
+            authorizer,
+            cache,
+            policy_sync,
+            cache_ttl,
+            path_pattern_matcher: Some(path_pattern_matcher),
         }
     }
 }
@@ -134,34 +165,6 @@ impl Resolver for BilletResolverImpl {
             }
         }
 
-        // Step 2: Fetch selectors from SelectorEnricher (graceful degradation built-in)
-        let fetched_selectors = self
-            .selector_enricher
-            .fetch_selectors(&input.spiffe_id)
-            .await
-            .unwrap_or_else(|e| {
-                warn!(error = %e, "selector enrichment failed, using input selectors only");
-                Vec::new()
-            });
-
-        // Step 3: Combine input selectors with fetched selectors
-        let mut combined_selectors = input.selectors.clone();
-        for sel in fetched_selectors {
-            if !combined_selectors.contains(&sel) {
-                combined_selectors.push(sel);
-            }
-        }
-
-        // Step 4: Build ephemeral entity via EntityBuilder
-        let entity_input = EntityBuilderInput {
-            spiffe_id: input.spiffe_id.clone(),
-            trust_domain: input.trust_domain.clone(),
-            environment: input.environment.clone(),
-            region: input.region.clone(),
-            selectors: combined_selectors.clone(),
-        };
-        let workload_entity = self.entity_builder.build(entity_input);
-
         // Step 5: Get known_billets from PolicySyncService
         let known_billets = self.policy_sync.known_billets().await;
 
@@ -176,27 +179,94 @@ impl Resolver for BilletResolverImpl {
             return Err(BilletError::NoBilletsResolved);
         }
 
-        // Step 6: Call LocalAuthorizer::batch_is_authorized
         let resources: Vec<String> = known_billets.into_iter().collect();
-        let batch_req = BatchAuthzRequest {
-            principal: workload_entity,
-            action: "assumeBillet".to_string(),
-            resources,
-            context: CommonContext {
+
+        // Step 2-6: Route between path-pattern mode and legacy entity builder mode
+        let decisions = if let Some(ref matcher) = self.path_pattern_matcher {
+            // ─── Path-pattern mode ─────────────────────────────────────────────
+            // Skip selector enrichment entirely. Extract attributes from the SPIFFE ID
+            // path using regex captures, then build Cedar entities directly.
+            let captures = matcher.extract(&input.spiffe_id);
+
+            let principal_entities = build_workload_entities_from_captures(
+                &input.spiffe_id,
+                &input.trust_domain,
+                &captures,
+            )
+            .map_err(|e| BilletError::InternalError(format!("entity construction failed: {e}")))?;
+
+            let entity_req = EntityBatchAuthzRequest {
+                principal_type: "Workload".to_string(),
+                principal_id: input.spiffe_id.clone(),
+                principal_entities,
+                action: "assumeBillet".to_string(),
+                resources,
+                context: CommonContext {
+                    environment: input.environment.clone(),
+                    region: input.region.clone(),
+                    request_time: input.request_time.to_rfc3339(),
+                    source_type: "spire".to_string(),
+                    source_cloud: input.source_cloud.clone(),
+                    selectors: vec![], // Always empty in path-pattern mode
+                },
+            };
+
+            self.authorizer
+                .batch_is_authorized_entity(entity_req, &HashMap::new())
+                .await
+                .map_err(|e| BilletError::InternalError(format!("authorization failed: {e}")))?
+        } else {
+            // ─── Legacy mode ───────────────────────────────────────────────────
+            // Use selector enrichment + EntityBuilder (existing behavior unchanged)
+
+            // Step 2: Fetch selectors from SelectorEnricher (graceful degradation built-in)
+            let fetched_selectors = self
+                .selector_enricher
+                .fetch_selectors(&input.spiffe_id)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(error = %e, "selector enrichment failed, using input selectors only");
+                    Vec::new()
+                });
+
+            // Step 3: Combine input selectors with fetched selectors
+            let mut combined_selectors = input.selectors.clone();
+            for sel in fetched_selectors {
+                if !combined_selectors.contains(&sel) {
+                    combined_selectors.push(sel);
+                }
+            }
+
+            // Step 4: Build ephemeral entity via EntityBuilder
+            let entity_input = EntityBuilderInput {
+                spiffe_id: input.spiffe_id.clone(),
+                trust_domain: input.trust_domain.clone(),
                 environment: input.environment.clone(),
                 region: input.region.clone(),
-                request_time: input.request_time.to_rfc3339(),
-                source_type: "spire".to_string(),
-                source_cloud: input.source_cloud.clone(),
-                selectors: combined_selectors,
-            },
-        };
+                selectors: combined_selectors.clone(),
+            };
+            let workload_entity = self.entity_builder.build(entity_input);
 
-        let decisions = self
-            .authorizer
-            .batch_is_authorized(batch_req, &HashMap::new())
-            .await
-            .map_err(|e| BilletError::InternalError(format!("authorization failed: {e}")))?;
+            // Step 6: Call LocalAuthorizer::batch_is_authorized
+            let batch_req = BatchAuthzRequest {
+                principal: workload_entity,
+                action: "assumeBillet".to_string(),
+                resources,
+                context: CommonContext {
+                    environment: input.environment.clone(),
+                    region: input.region.clone(),
+                    request_time: input.request_time.to_rfc3339(),
+                    source_type: "spire".to_string(),
+                    source_cloud: input.source_cloud.clone(),
+                    selectors: combined_selectors,
+                },
+            };
+
+            self.authorizer
+                .batch_is_authorized(batch_req, &HashMap::new())
+                .await
+                .map_err(|e| BilletError::InternalError(format!("authorization failed: {e}")))?
+        };
 
         // Step 7: Filter Allow decisions → collect billet names
         let billets: Vec<String> = decisions
@@ -766,6 +836,183 @@ mod tests {
         assert!(!result.billets.contains(&"analytics".to_string()));
         assert!(result.billets.contains(&"payments".to_string()));
         assert!(result.billets.contains(&"reporting".to_string()));
+    }
+
+    // --- Path-pattern mode tests ---
+
+    #[tokio::test]
+    async fn test_path_pattern_mode_uses_entity_batch_authz() {
+        let cache = Arc::new(InMemoryCache::new());
+        let policy_sync = make_initialized_policy_sync().await;
+
+        // SelectorEnricher should NOT be called in path-pattern mode
+        let mut mock_enricher = MockSelectorEnricher::new();
+        mock_enricher.expect_fetch_selectors().never();
+
+        // The authorizer should receive batch_is_authorized_entity (not batch_is_authorized)
+        let mut mock_authorizer = MockLocalAuthorizer::new();
+        mock_authorizer.expect_batch_is_authorized().never();
+        mock_authorizer
+            .expect_batch_is_authorized_entity()
+            .returning(|req, _billet_tags| {
+                // Verify the entity request uses Workload type
+                assert_eq!(req.principal_type, "Workload");
+                assert!(req.principal_id.starts_with("spiffe://"));
+                // Verify empty selectors in context (path-pattern mode)
+                assert!(req.context.selectors.is_empty());
+                Ok(req
+                    .resources
+                    .iter()
+                    .map(|r| AuthzDecision {
+                        resource: r.clone(),
+                        decision: Decision::Allow,
+                    })
+                    .collect())
+            });
+
+        // Build a PathPatternMatcher
+        let configs = vec![crate::config::PathPatternConfig {
+            pattern: r"^/ns/(?P<namespace>[^/]+)/workload/(?P<workload>[^/]+)$".to_string(),
+        }];
+        let matcher = Arc::new(
+            crate::domain::identity::path_pattern::PathPatternMatcher::compile(
+                "example.org",
+                &configs,
+            )
+            .unwrap(),
+        );
+
+        let resolver = BilletResolverImpl::with_path_pattern_matcher(
+            Arc::new(mock_enricher),
+            EntityBuilder::new(),
+            Arc::new(mock_authorizer),
+            cache,
+            policy_sync,
+            Duration::from_secs(300),
+            matcher,
+        );
+
+        let input = ResolverInput {
+            spiffe_id: "spiffe://example.org/ns/finance/workload/payments".to_string(),
+            trust_domain: "example.org".to_string(),
+            environment: "production".to_string(),
+            region: "us-east-1".to_string(),
+            audience: "https://api.example.com".to_string(),
+            request_time: chrono::Utc::now(),
+            source_cloud: String::new(),
+            selectors: vec![],
+        };
+
+        let result = resolver.resolve(input).await.unwrap();
+        assert!(!result.cache_hit);
+        assert_eq!(result.billets, vec!["payments"]);
+    }
+
+    #[tokio::test]
+    async fn test_path_pattern_mode_no_match_still_resolves() {
+        // When no pattern matches, the entity should still have spiffe_id + trust_domain
+        let cache = Arc::new(InMemoryCache::new());
+        let policy_sync = make_initialized_policy_sync().await;
+
+        let mut mock_enricher = MockSelectorEnricher::new();
+        mock_enricher.expect_fetch_selectors().never();
+
+        let mut mock_authorizer = MockLocalAuthorizer::new();
+        mock_authorizer.expect_batch_is_authorized().never();
+        mock_authorizer
+            .expect_batch_is_authorized_entity()
+            .returning(|req, _billet_tags| {
+                assert_eq!(req.principal_type, "Workload");
+                Ok(req
+                    .resources
+                    .iter()
+                    .map(|r| AuthzDecision {
+                        resource: r.clone(),
+                        decision: Decision::Allow,
+                    })
+                    .collect())
+            });
+
+        // Pattern that won't match the test SPIFFE ID
+        let configs = vec![crate::config::PathPatternConfig {
+            pattern: r"^/env/(?P<environment>[^/]+)/region/(?P<region>[^/]+)$".to_string(),
+        }];
+        let matcher = Arc::new(
+            crate::domain::identity::path_pattern::PathPatternMatcher::compile(
+                "example.org",
+                &configs,
+            )
+            .unwrap(),
+        );
+
+        let resolver = BilletResolverImpl::with_path_pattern_matcher(
+            Arc::new(mock_enricher),
+            EntityBuilder::new(),
+            Arc::new(mock_authorizer),
+            cache,
+            policy_sync,
+            Duration::from_secs(300),
+            matcher,
+        );
+
+        let input = ResolverInput {
+            spiffe_id: "spiffe://example.org/ns/finance/workload/payments".to_string(),
+            trust_domain: "example.org".to_string(),
+            environment: "production".to_string(),
+            region: "us-east-1".to_string(),
+            audience: "https://api.example.com".to_string(),
+            request_time: chrono::Utc::now(),
+            source_cloud: String::new(),
+            selectors: vec![],
+        };
+
+        let result = resolver.resolve(input).await.unwrap();
+        assert!(!result.cache_hit);
+        // Resolution still succeeds (all billets allowed via mock)
+        assert_eq!(result.billets, vec!["payments"]);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_mode_still_uses_batch_is_authorized() {
+        // Without path_pattern_matcher, should use the legacy flow
+        let cache = Arc::new(InMemoryCache::new());
+        let policy_sync = make_initialized_policy_sync().await;
+
+        let mut mock_enricher = MockSelectorEnricher::new();
+        mock_enricher
+            .expect_fetch_selectors()
+            .returning(|_| Ok(vec!["k8s:sa:payments-sa".to_string()]));
+
+        let mut mock_authorizer = MockLocalAuthorizer::new();
+        // Legacy path uses batch_is_authorized (NOT batch_is_authorized_entity)
+        mock_authorizer.expect_batch_is_authorized_entity().never();
+        mock_authorizer
+            .expect_batch_is_authorized()
+            .returning(|req, _billet_tags| {
+                // Verify selectors are populated (legacy mode enriches them)
+                assert!(!req.context.selectors.is_empty());
+                Ok(req
+                    .resources
+                    .iter()
+                    .map(|r| AuthzDecision {
+                        resource: r.clone(),
+                        decision: Decision::Allow,
+                    })
+                    .collect())
+            });
+
+        let resolver = BilletResolverImpl::new(
+            Arc::new(mock_enricher),
+            EntityBuilder::new(),
+            Arc::new(mock_authorizer),
+            cache,
+            policy_sync,
+            Duration::from_secs(300),
+        );
+
+        let result = resolver.resolve(make_input()).await.unwrap();
+        assert!(!result.cache_hit);
+        assert_eq!(result.billets, vec!["payments"]);
     }
 
     // --- scope_billets unit tests ---

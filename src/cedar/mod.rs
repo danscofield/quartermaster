@@ -383,6 +383,45 @@ fn build_workload_entities(workload: &WorkloadEntity) -> Result<Vec<Entity>, Ced
     Ok(entities)
 }
 
+/// Builds Cedar entities for a workload authenticated via path pattern extraction.
+/// Bypasses WorkloadEntity entirely — constructs the Cedar Entity directly from captures.
+///
+/// Entity type is always Quartermaster::Workload (no platform subtypes, no parent hierarchy).
+/// Attributes: spiffe_id, trust_domain, plus all key-value pairs from captures.
+/// Selectors: always empty (no SPIRE API call).
+pub fn build_workload_entities_from_captures(
+    spiffe_id: &str,
+    trust_domain: &str,
+    captures: &HashMap<String, String>,
+) -> Result<Vec<Entity>, CedarError> {
+    let principal_uid = make_entity_uid("Workload", spiffe_id)?;
+
+    let mut attrs: HashMap<String, RestrictedExpression> = HashMap::new();
+    attrs.insert(
+        "spiffe_id".to_string(),
+        RestrictedExpression::new_string(spiffe_id.to_string()),
+    );
+    attrs.insert(
+        "trust_domain".to_string(),
+        RestrictedExpression::new_string(trust_domain.to_string()),
+    );
+
+    // Add all captured attributes as String values
+    for (name, value) in captures {
+        attrs.insert(
+            name.clone(),
+            RestrictedExpression::new_string(value.clone()),
+        );
+    }
+
+    // No parent hierarchy — path-pattern entities are always base Workload
+    // Empty selectors set (no SPIRE API call in path-pattern mode)
+    let entity = Entity::new(principal_uid, attrs, HashSet::new())
+        .map_err(|e| CedarError::EvaluationFailed(format!("Failed to create entity: {e}")))?;
+
+    Ok(vec![entity])
+}
+
 #[async_trait::async_trait]
 impl LocalAuthorizer for CedarAuthorizer {
     async fn batch_is_authorized(

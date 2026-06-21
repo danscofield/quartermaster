@@ -215,46 +215,102 @@ async fn main() {
         ),
     );
 
-    // Initialize SelectorEnricher: use SPIRE API if configured, otherwise no-op.
-    let selector_enricher: Arc<dyn quartermaster::domain::billet::selector::SelectorEnricher> =
-        if let Some(ref identity_config) = config.identity {
-            if let Some(ref spire_source) = identity_config.spire {
-                // New identity config: use configured server_addr or default
-                let addr = spire_source
-                    .server_addr
-                    .clone()
-                    .unwrap_or_else(|| "http://localhost:8081".to_string());
+    // Initialize SelectorEnricher with mode selection based on path_patterns configuration.
+    //
+    // Mode selection logic:
+    // | path_patterns | server_addr | Behavior                                    |
+    // |---------------|-------------|---------------------------------------------|
+    // | Non-empty     | Any         | PathPatternMatcher (no API calls)           |
+    // | Empty/absent  | Present     | SpireSelectorEnricher (API calls)           |
+    // | Empty/absent  | Absent      | NoOpSelectorEnricher (spiffe_id + trust_domain only) |
+    let (selector_enricher, path_pattern_matcher): (
+        Arc<dyn quartermaster::domain::billet::selector::SelectorEnricher>,
+        Option<Arc<quartermaster::domain::identity::path_pattern::PathPatternMatcher>>,
+    ) = if let Some(ref identity_config) = config.identity {
+        if let Some(ref spire_source) = identity_config.spire {
+            if !spire_source.path_patterns.is_empty() {
+                // Path patterns configured: compile patterns and skip SPIRE API calls
+                let matcher = quartermaster::domain::identity::path_pattern::PathPatternMatcher::compile(
+                    &spire_source.trust_domain,
+                    &spire_source.path_patterns,
+                )
+                .unwrap_or_else(|errors| {
+                    let msgs: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+                    panic!("invalid path patterns in [identity.spire]: {}", msgs.join("; "));
+                });
+
+                // Log warnings for patterns with no named captures
+                for warning in matcher.warnings() {
+                    tracing::warn!("{}", warning);
+                }
+
+                // Log info if server_addr is also configured (it will be ignored)
+                if spire_source.server_addr.is_some() {
+                    tracing::info!(
+                        "server_addr is ignored when path_patterns are configured"
+                    );
+                }
+
+                tracing::info!(
+                    pattern_count = spire_source.path_patterns.len(),
+                    "SPIRE identity source using path pattern mode (no API calls)"
+                );
+
+                (Arc::new(NoOpSelectorEnricher) as Arc<dyn quartermaster::domain::billet::selector::SelectorEnricher>, Some(Arc::new(matcher)))
+            } else if let Some(ref addr) = spire_source.server_addr {
+                // No path patterns + server_addr present: legacy SPIRE API enrichment
                 let spire_api_client: Arc<dyn quartermaster::spireapi::SpireApiClient> =
-                    Arc::new(HttpSpireApiClient::new(addr));
-                Arc::new(SpireSelectorEnricher::new(spire_api_client))
+                    Arc::new(HttpSpireApiClient::new(addr.clone()));
+                tracing::info!(
+                    server_addr = %addr,
+                    "SPIRE identity source using API enrichment mode"
+                );
+                (Arc::new(SpireSelectorEnricher::new(spire_api_client)) as Arc<dyn quartermaster::domain::billet::selector::SelectorEnricher>, None)
             } else {
-                // Identity config exists but no SPIRE source configured
-                Arc::new(NoOpSelectorEnricher)
+                // No path patterns + no server_addr: no-op enricher
+                tracing::info!("SPIRE identity source using no-op enricher (no server_addr, no path_patterns)");
+                (Arc::new(NoOpSelectorEnricher) as Arc<dyn quartermaster::domain::billet::selector::SelectorEnricher>, None)
             }
-        } else if config.spire.is_some() {
-            // Legacy SPIRE config present (no server_addr field), use default address
-            let spire_api_client: Arc<dyn quartermaster::spireapi::SpireApiClient> =
-                Arc::new(HttpSpireApiClient::new("http://localhost:8081".to_string()));
-            Arc::new(SpireSelectorEnricher::new(spire_api_client))
         } else {
-            // No SPIRE configured anywhere, use no-op enricher
-            Arc::new(NoOpSelectorEnricher)
-        };
+            // Identity config exists but no SPIRE source configured
+            (Arc::new(NoOpSelectorEnricher) as Arc<dyn quartermaster::domain::billet::selector::SelectorEnricher>, None)
+        }
+    } else if config.spire.is_some() {
+        // Legacy SPIRE config present (no server_addr field), use default address
+        let spire_api_client: Arc<dyn quartermaster::spireapi::SpireApiClient> =
+            Arc::new(HttpSpireApiClient::new("http://localhost:8081".to_string()));
+        (Arc::new(SpireSelectorEnricher::new(spire_api_client)) as Arc<dyn quartermaster::domain::billet::selector::SelectorEnricher>, None)
+    } else {
+        // No SPIRE configured anywhere, use no-op enricher
+        (Arc::new(NoOpSelectorEnricher) as Arc<dyn quartermaster::domain::billet::selector::SelectorEnricher>, None)
+    };
 
     // Initialize EntityBuilder
     let entity_builder = EntityBuilder::new();
 
     // Initialize BilletResolverImpl
-    let resolver: Arc<dyn quartermaster::domain::billet::Resolver> = Arc::new(
-        BilletResolverImpl::new(
+    let resolver: Arc<dyn quartermaster::domain::billet::Resolver> = if let Some(ref matcher) = path_pattern_matcher {
+        // Path-pattern mode: resolver bypasses selector enrichment and uses regex captures
+        Arc::new(BilletResolverImpl::with_path_pattern_matcher(
             selector_enricher,
             entity_builder,
             Arc::clone(&local_authorizer),
             Arc::clone(&cache),
             Arc::clone(&policy_sync),
             Duration::from_secs(config.cache.ttl_secs),
-        ),
-    );
+            Arc::clone(matcher),
+        ))
+    } else {
+        // Legacy mode: selector enrichment + EntityBuilder
+        Arc::new(BilletResolverImpl::new(
+            selector_enricher,
+            entity_builder,
+            Arc::clone(&local_authorizer),
+            Arc::clone(&cache),
+            Arc::clone(&policy_sync),
+            Duration::from_secs(config.cache.ttl_secs),
+        ))
+    };
 
     // Initialize Es256Issuer
     let issuer: Arc<dyn quartermaster::domain::token::Issuer> = Arc::new(Es256Issuer::new(
@@ -497,6 +553,7 @@ async fn main() {
         implicit_billet_mapper,
         jwks_manager,
         mtls_validator,
+        path_pattern_matcher,
     });
 
     // ─── Start HTTP Server(s) ─────────────────────────────────────────────────

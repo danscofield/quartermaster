@@ -6,6 +6,7 @@ use std::fmt;
 #[derive(Debug, Clone)]
 pub struct RegistrationEntry {
     pub spiffe_id: String,
+    pub parent_id: Option<String>,
     pub selectors: Vec<String>, // e.g., ["k8s:ns:finance", "k8s:sa:payments-sa"]
 }
 
@@ -83,6 +84,7 @@ mod api_types {
     #[derive(Debug, Deserialize)]
     pub struct Entry {
         pub spiffe_id: Option<SpiffeId>,
+        pub parent_id: Option<SpiffeId>,
         pub selectors: Option<Vec<Selector>>,
     }
 
@@ -146,9 +148,15 @@ impl SpireApiClient for HttpSpireApiClient {
 
         // Find the entry matching the requested SPIFFE ID and collect selectors
         let mut selectors = Vec::new();
+        let mut parent_id = None;
         let mut found = false;
 
         for entry in &entries {
+            if let Some(ref pid) = entry.parent_id {
+                if let (Some(ref td), Some(ref path)) = (&pid.trust_domain, &pid.path) {
+                    parent_id = Some(format!("spiffe://{}{}", td, path));
+                }
+            }
             if let Some(ref entry_selectors) = entry.selectors {
                 for selector in entry_selectors {
                     if let (Some(ref sel_type), Some(ref value)) =
@@ -167,6 +175,7 @@ impl SpireApiClient for HttpSpireApiClient {
 
         Ok(Some(RegistrationEntry {
             spiffe_id: spiffe_id.to_string(),
+            parent_id,
             selectors,
         }))
     }
@@ -205,12 +214,13 @@ mod tests {
     #[test]
     fn test_registration_entry_creation() {
         let entry = RegistrationEntry {
-            spiffe_id: "spiffe://example.org/workload".to_string(),
-            selectors: vec![
-                "k8s:ns:finance".to_string(),
-                "k8s:sa:payments-sa".to_string(),
-            ],
-        };
+                    spiffe_id: "spiffe://example.org/workload".to_string(),
+                    parent_id: None,
+                    selectors: vec![
+                        "k8s:ns:finance".to_string(),
+                        "k8s:sa:payments-sa".to_string(),
+                    ],
+                };
 
         assert_eq!(entry.spiffe_id, "spiffe://example.org/workload");
         assert_eq!(entry.selectors.len(), 2);
@@ -250,9 +260,10 @@ mod tests {
     #[test]
     fn test_registration_entry_clone() {
         let entry = RegistrationEntry {
-            spiffe_id: "spiffe://example.org/workload".to_string(),
-            selectors: vec!["k8s:ns:default".to_string()],
-        };
+                    spiffe_id: "spiffe://example.org/workload".to_string(),
+                    parent_id: None,
+                    selectors: vec!["k8s:ns:default".to_string()],
+                };
         let cloned = entry.clone();
         assert_eq!(cloned.spiffe_id, entry.spiffe_id);
         assert_eq!(cloned.selectors, entry.selectors);

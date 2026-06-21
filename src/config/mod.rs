@@ -13,7 +13,7 @@ pub use backends::{
 };
 pub use identity::{
     AwsStsSourceConfig, GcpSourceConfig, IdentityConfig, IdentityConfigError,
-    ImplicitClaimConfig, OidcSourceConfig, SpireSourceConfig,
+    ImplicitClaimConfig, OidcSourceConfig, PathPatternConfig, SpireSourceConfig,
 };
 
 /// Top-level application configuration.
