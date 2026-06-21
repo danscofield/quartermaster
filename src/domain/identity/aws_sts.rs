@@ -219,7 +219,7 @@ impl AwsStsValidator for DefaultAwsStsValidator {
         // 2. Call the presigned URL
         let response = self
             .http_client
-            .get(url.as_str())
+            .post(url.as_str())
             .send()
             .await
             .map_err(|e| {
@@ -242,15 +242,34 @@ impl AwsStsValidator for DefaultAwsStsValidator {
         // 3. Parse XML response
         let (account, arn, _user_id) = parse_get_caller_identity_xml(&body)?;
 
-        // 4. Parse the ARN to extract role components
-        let parsed = parse_assumed_role_arn(&arn)?;
+        // 4. Parse the ARN to extract identity components
+        //    Supports both assumed-role ARNs (arn:aws:sts::*:assumed-role/name/session)
+        //    and IAM user/role ARNs (arn:aws:iam::*:user/name or arn:aws:iam::*:role/name)
+        let (role_name, session_name) = if arn.contains(":assumed-role/") {
+            let parsed = parse_assumed_role_arn(&arn)?;
+            (parsed.role_name, parsed.session_name)
+        } else if arn.contains(":user/") {
+            // IAM user: arn:aws:iam::123:user/username or arn:aws:iam::123:user/path/username
+            let resource = arn.splitn(6, ':').last().unwrap_or("");
+            let user_name = resource.strip_prefix("user/").unwrap_or(resource);
+            // Take the last segment after any path separators
+            let name = user_name.rsplit('/').next().unwrap_or(user_name);
+            (name.to_string(), String::new())
+        } else if arn.contains(":role/") {
+            let parsed = parse_iam_role_arn(&arn)?;
+            (parsed.role_name, String::new())
+        } else {
+            return Err(IdentityError::InvalidPresignedUrl(format!(
+                "unsupported ARN format: {arn}"
+            )));
+        };
 
         // 5. Apply allowed_accounts filter
         if let Some(ref allowed) = self.config.allowed_accounts {
-            if !allowed.contains(&parsed.account_id) {
+            if !allowed.contains(&account) {
                 return Err(IdentityError::NotAllowed(format!(
                     "AWS account '{}' is not in the allowed accounts list",
-                    parsed.account_id
+                    account
                 )));
             }
         }
@@ -258,10 +277,10 @@ impl AwsStsValidator for DefaultAwsStsValidator {
         // 6. Return AwsStsIdentity
         Ok(AwsStsIdentity {
             account_id: account,
-            role_arn: arn,
-            role_name: parsed.role_name,
+            role_arn: arn.clone(),
+            role_name,
             role_path: "/".to_string(),
-            session_name: parsed.session_name,
+            session_name,
         })
     }
 }

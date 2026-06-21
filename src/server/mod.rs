@@ -89,7 +89,7 @@ pub fn build_main_router(state: Arc<AppState>, include_admin: bool) -> Router {
         .route("/jwks.json", get(handler::jwks::jwks))
         .route("/ca/chain.pem", get(handler::ca::ca_chain))
         .route("/healthz", get(handler::health::healthz))
-        .route("/billets/{name}", get(handler::billets::get_billet))
+        .route("/billets/:name", get(handler::billets::get_billet))
         .route("/billets/me", post(handler::billets_discovery::billet_discovery));
 
     if include_admin {
@@ -100,18 +100,18 @@ pub fn build_main_router(state: Arc<AppState>, include_admin: bool) -> Router {
                     .get(handler::admin_billets::list_billets),
             )
             .route(
-                "/admin/billets/{name}",
+                "/admin/billets/:name",
                 get(handler::admin_billets::get_billet)
                     .put(handler::admin_billets::update_billet)
                     .delete(handler::admin_billets::delete_billet),
             )
             .route(
-                "/admin/billets/{name}/policies",
+                "/admin/billets/:name/policies",
                 post(handler::admin_billets::create_policy)
                     .get(handler::admin_billets::list_policies),
             )
             .route(
-                "/admin/billets/{name}/policies/{id}",
+                "/admin/billets/:name/policies/:id",
                 get(handler::admin_billets::get_policy)
                     .put(handler::admin_billets::update_policy)
                     .delete(handler::admin_billets::delete_policy),
@@ -133,18 +133,18 @@ pub fn build_admin_router(state: Arc<AppState>) -> Router {
                 .get(handler::admin_billets::list_billets),
         )
         .route(
-            "/admin/billets/{name}",
+            "/admin/billets/:name",
             get(handler::admin_billets::get_billet)
                 .put(handler::admin_billets::update_billet)
                 .delete(handler::admin_billets::delete_billet),
         )
         .route(
-            "/admin/billets/{name}/policies",
+            "/admin/billets/:name/policies",
             post(handler::admin_billets::create_policy)
                 .get(handler::admin_billets::list_policies),
         )
         .route(
-            "/admin/billets/{name}/policies/{id}",
+            "/admin/billets/:name/policies/:id",
             get(handler::admin_billets::get_policy)
                 .put(handler::admin_billets::update_policy)
                 .delete(handler::admin_billets::delete_policy),

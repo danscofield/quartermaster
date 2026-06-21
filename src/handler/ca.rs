@@ -14,13 +14,13 @@ use crate::server::AppState;
     path = "/ca/chain.pem",
     tag = "discovery",
     responses(
-        (status = 200, description = "CA certificate chain in PEM format", content_type = "application/x-pem-file"),
+        (status = 200, description = "CA certificate chain in PEM format", content_type = "text/plain"),
     )
 )]
 pub async fn ca_chain(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let pem = state.authority.chain_pem();
     (
-        [(header::CONTENT_TYPE, "application/x-pem-file")],
+        [(header::CONTENT_TYPE, "text/plain")],
         pem.to_vec(),
     )
 }

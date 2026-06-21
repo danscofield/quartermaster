@@ -93,9 +93,9 @@ type = "stdout"
 # in_tokens = false
 
 # --- AWS STS identity source ---
-# [identity.aws_sts]
-# enabled = true
-# allowed_accounts = ["123456789012", "987654321098"]
+[identity.aws_sts]
+enabled = true
+#allowed_accounts = ["526484194718"]
 
 # --- GCP identity source ---
 # [identity.gcp]
