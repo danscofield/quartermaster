@@ -317,6 +317,7 @@ mod tests {
             sub: "spiffe://example.com/workload".to_string(),
             aud: "https://qm.example.com".to_string(),
             billets: vec!["admin".to_string()],
+            amr: vec!["admin".to_string()],
             iat: now - 600,
             exp: now - 300, // expired 5 minutes ago
             jti: "test-jti".to_string(),

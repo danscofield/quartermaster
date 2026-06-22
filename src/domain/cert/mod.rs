@@ -340,9 +340,12 @@ impl Authority for LocalAuthority {
         // 4. Build certificate parameters - discard CSR Subject/SANs/extensions
         let mut params = CertificateParams::default();
 
-        // Subject CN = SPIFFE ID
+        // Subject CN = identity, OU = one per billet
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, &req.spiffe_id);
+        for billet in &req.billets {
+            dn.push(DnType::OrganizationalUnitName, billet);
+        }
         params.distinguished_name = dn;
 
         // URI SANs: SPIFFE ID + qm-billet://{trust_domain}/{billet} for each billet
