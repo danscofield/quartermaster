@@ -59,6 +59,8 @@ pub struct Claims {
     pub aud: String,
     /// Billet names the workload holds
     pub billets: Vec<String>,
+    /// Authentication Methods References — mirrors billets for AWS OIDC condition key support
+    pub amr: Vec<String>,
     /// Issued-at timestamp (unix seconds)
     pub iat: u64,
     /// Expiration timestamp (unix seconds)
@@ -118,6 +120,7 @@ impl Issuer for Es256Issuer {
             iss: self.issuer_url.clone(),
             sub,
             aud: req.audience,
+            amr: req.billets.clone(),
             billets: req.billets,
             iat: now,
             exp,

@@ -2,7 +2,7 @@
 #
 # Run with: QM_CONFIG_PATH=./example/config.toml cargo run
 
-issuer = "http://localhost:8443"
+issuer = "https://localhost:8443"
 token_ttl_secs = 300
 
 [server]
