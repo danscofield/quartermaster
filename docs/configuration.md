@@ -122,6 +122,11 @@ cert_path = "/etc/quartermaster/keys/ca.cert.pem"
 issuer_cn = "Quartermaster CA"
 cert_ttl = "1h"   # matches token_ttl by default
 
+# Include billets as OU in certificate Subject (format: qm-billets:billet1:billet2:)
+# Enables IAM Roles Anywhere to condition on billets via StringLike on x509Subject/OU.
+# Default: false
+include_billets_ou = true
+
 # --- In-memory CA key (dev/test) ---
 [ca.memory]
 key_path = "/etc/quartermaster/keys/ca.key.pem"
