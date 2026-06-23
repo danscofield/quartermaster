@@ -148,7 +148,7 @@ async fn main() {
                 .expect("failed to read CA certificate");
 
             Arc::new(
-                LocalAuthority::new(&ca_key_pem, &ca_cert_pem, Duration::from_secs(config.ca.ttl_secs))
+                LocalAuthority::new(&ca_key_pem, &ca_cert_pem, Duration::from_secs(config.ca.ttl_secs), config.ca.include_billets_ou)
                     .expect("failed to initialize CA"),
             )
         };
@@ -264,6 +264,7 @@ async fn main() {
         Arc::clone(&signing_manager),
         config.issuer.clone(),
         config.token_ttl_secs,
+        config.billet_claims.clone(),
     ));
 
     // Initialize AdminAuthenticatorImpl

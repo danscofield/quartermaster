@@ -69,6 +69,11 @@ pub struct Config {
     /// Defaults to ["quartermaster-admin", "quartermaster-guardrails"] if omitted.
     #[serde(default = "default_system_billets")]
     pub system_billets: Vec<String>,
+
+    /// Additional JWT claims to copy the billets array into (e.g., ["amr"] for AWS OIDC federation).
+    /// Default: [] (billets only in the "billets" claim)
+    #[serde(default)]
+    pub billet_claims: Vec<String>,
 }
 
 /// SPIRE trust domain configuration.
@@ -123,6 +128,12 @@ pub struct CaConfig {
     /// Certificate TTL in seconds
     #[serde(default = "default_ttl_secs")]
     pub ttl_secs: u64,
+
+    /// Include billets as OU in certificate Subject (format: qm-billets:billet1:billet2:)
+    /// Useful for IAM Roles Anywhere condition matching.
+    /// Default: false
+    #[serde(default)]
+    pub include_billets_ou: bool,
 }
 
 /// Cache configuration.
@@ -481,6 +492,7 @@ impl Config {
             key_path: PathBuf::from(env_required("QM_CA_KEY_PATH")?),
             cert_path: PathBuf::from(env_required("QM_CA_CERT_PATH")?),
             ttl_secs: env_parse_or_default("QM_CA_TTL_SECS", default_ttl_secs())?,
+            include_billets_ou: false,
         };
 
         let cache = CacheConfig {
@@ -524,6 +536,7 @@ impl Config {
             ca_backend: None,
             identity: None,
             system_billets: default_system_billets(),
+            billet_claims: vec![],
         };
 
         config.validate()?;
@@ -579,6 +592,7 @@ mod tests {
                 key_path: PathBuf::from("/etc/qm/ca.key"),
                 cert_path: PathBuf::from("/etc/qm/ca.crt"),
                 ttl_secs: 300,
+                include_billets_ou: false,
             },
             cache: CacheConfig {
                 backend: CacheBackend::Memory,
@@ -600,6 +614,7 @@ mod tests {
             ca_backend: None,
             identity: None,
             system_billets: default_system_billets(),
+            billet_claims: vec![],
         }
     }
 

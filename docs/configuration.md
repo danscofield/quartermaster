@@ -32,6 +32,12 @@ issuer = "https://quartermaster.example.com"
 # Default token TTL. Workloads can request shorter but not longer.
 token_ttl = "1h"
 
+# Additional JWT claims to copy the billets array into.
+# Useful for AWS OIDC federation (which supports "amr" as a condition key).
+# Default: [] (billets only in the "billets" claim)
+# Example: ["amr"] → JWT gets "amr": ["billet1", "billet2"] alongside "billets"
+billet_claims = ["amr"]
+
 # ─── Server ───────────────────────────────────────────────────────────────────
 
 [server]

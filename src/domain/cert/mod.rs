@@ -67,6 +67,7 @@ pub struct LocalAuthority {
     ca_cert_pem: Vec<u8>,
     ca_cert_params: Arc<CertificateParams>,
     ttl: Duration,
+    include_billets_ou: bool,
     _rng: SystemRandom,
 }
 
@@ -90,6 +91,7 @@ impl LocalAuthority {
         ca_key_pem: &str,
         ca_cert_pem: &str,
         ttl: Duration,
+        include_billets_ou: bool,
     ) -> Result<Self, CertError> {
         let ca_key_pair = KeyPair::from_pem(ca_key_pem)
             .map_err(|e| CertError::CaNotReady(format!("failed to parse CA key: {}", e)))?;
@@ -103,6 +105,7 @@ impl LocalAuthority {
             ca_cert_pem: ca_cert_pem.as_bytes().to_vec(),
             ca_cert_params: Arc::new(ca_cert_params),
             ttl,
+            include_billets_ou,
             _rng: SystemRandom::new(),
         })
     }
@@ -344,7 +347,7 @@ impl Authority for LocalAuthority {
         // Format: qm-billets:billet1:billet2: (trailing colon for consistent StringLike matching)
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, &req.spiffe_id);
-        if !req.billets.is_empty() {
+        if self.include_billets_ou && !req.billets.is_empty() {
             let ou_value = format!("qm-billets:{}:", req.billets.join(":"));
             dn.push(DnType::OrganizationalUnitName, &ou_value);
         }
@@ -465,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn test_issue_certificate_success() {
         let (ca_key_pem, ca_cert_pem) = generate_test_ca();
-        let authority = LocalAuthority::new(&ca_key_pem, &ca_cert_pem, Duration::from_secs(300))
+        let authority = LocalAuthority::new(&ca_key_pem, &ca_cert_pem, Duration::from_secs(300), false)
             .expect("failed to create authority");
 
         let (csr_der, _key_pair) = generate_test_csr();
@@ -497,7 +500,7 @@ mod tests {
     #[tokio::test]
     async fn test_issue_certificate_invalid_csr() {
         let (ca_key_pem, ca_cert_pem) = generate_test_ca();
-        let authority = LocalAuthority::new(&ca_key_pem, &ca_cert_pem, Duration::from_secs(300))
+        let authority = LocalAuthority::new(&ca_key_pem, &ca_cert_pem, Duration::from_secs(300), false)
             .expect("failed to create authority");
 
         let req = CertIssueRequest {
@@ -517,7 +520,7 @@ mod tests {
     #[tokio::test]
     async fn test_issue_certificate_corrupted_csr_signature() {
         let (ca_key_pem, ca_cert_pem) = generate_test_ca();
-        let authority = LocalAuthority::new(&ca_key_pem, &ca_cert_pem, Duration::from_secs(300))
+        let authority = LocalAuthority::new(&ca_key_pem, &ca_cert_pem, Duration::from_secs(300), false)
             .expect("failed to create authority");
 
         let (mut csr_der, _key_pair) = generate_test_csr();
@@ -545,7 +548,7 @@ mod tests {
     #[test]
     fn test_chain_pem_returns_ca_cert() {
         let (ca_key_pem, ca_cert_pem) = generate_test_ca();
-        let authority = LocalAuthority::new(&ca_key_pem, &ca_cert_pem, Duration::from_secs(300))
+        let authority = LocalAuthority::new(&ca_key_pem, &ca_cert_pem, Duration::from_secs(300), false)
             .expect("failed to create authority");
 
         let chain = authority.chain_pem();
@@ -571,7 +574,7 @@ mod tests {
     #[test]
     fn test_invalid_ca_key() {
         let (_, ca_cert_pem) = generate_test_ca();
-        let result = LocalAuthority::new("not a valid pem", &ca_cert_pem, Duration::from_secs(300));
+        let result = LocalAuthority::new("not a valid pem", &ca_cert_pem, Duration::from_secs(300), false);
         assert!(result.is_err());
         match result.unwrap_err() {
             CertError::CaNotReady(_) => {} // expected
@@ -699,7 +702,7 @@ mod property_tests {
             rt.block_on(async {
                 let (ca_key_pem, ca_cert_pem) = generate_test_ca();
                 let ttl = Duration::from_secs(ttl_secs);
-                let authority = LocalAuthority::new(&ca_key_pem, &ca_cert_pem, ttl)
+                let authority = LocalAuthority::new(&ca_key_pem, &ca_cert_pem, ttl, false)
                     .expect("failed to create authority");
 
                 // Generate CSR with arbitrary Subject/SANs that should be discarded
@@ -913,7 +916,7 @@ mod property_tests {
                 let authority = LocalAuthority::new(
                     &ca_key_pem,
                     &ca_cert_pem,
-                    Duration::from_secs(300),
+                    Duration::from_secs(300), false,
                 )
                 .expect("failed to create authority");
 
@@ -990,7 +993,7 @@ mod property_tests {
             rt.block_on(async {
                 let (ca_key_pem, ca_cert_pem) = generate_test_ca();
                 let ttl = Duration::from_secs(ttl_secs);
-                let authority = LocalAuthority::new(&ca_key_pem, &ca_cert_pem, ttl)
+                let authority = LocalAuthority::new(&ca_key_pem, &ca_cert_pem, ttl, false)
                     .expect("failed to create authority");
 
                 // Generate a CSR

@@ -59,8 +59,11 @@ pub struct Claims {
     pub aud: String,
     /// Billet names the workload holds
     pub billets: Vec<String>,
-    /// Authentication Methods References — mirrors billets for AWS OIDC condition key support
-    pub amr: Vec<String>,
+    /// Additional claims that mirror the billets array, keyed by claim name.
+    /// Populated based on the `billet_claims` config (e.g., ["amr"] → adds "amr": [...billets]).
+    /// Skipped from serialization when empty.
+    #[serde(flatten)]
+    pub billet_claims: std::collections::HashMap<String, Vec<String>>,
     /// Issued-at timestamp (unix seconds)
     pub iat: u64,
     /// Expiration timestamp (unix seconds)
@@ -84,6 +87,8 @@ pub struct Es256Issuer {
     signing_manager: Arc<dyn SigningManager>,
     issuer_url: String,
     ttl_secs: u64,
+    /// Claim names to copy billets into (e.g., ["amr"])
+    billet_claims: Vec<String>,
 }
 
 impl Es256Issuer {
@@ -93,15 +98,18 @@ impl Es256Issuer {
     /// * `signing_manager` - The signing key manager providing encoding key and header
     /// * `issuer_url` - The Quartermaster issuer URL (placed in `iss` claim)
     /// * `ttl_secs` - Token lifetime in seconds (used for `exp = iat + ttl`)
+    /// * `billet_claims` - Additional claim names to copy billets into
     pub fn new(
         signing_manager: Arc<dyn SigningManager>,
         issuer_url: String,
         ttl_secs: u64,
+        billet_claims: Vec<String>,
     ) -> Self {
         Self {
             signing_manager,
             issuer_url,
             ttl_secs,
+            billet_claims,
         }
     }
 }
@@ -120,7 +128,9 @@ impl Issuer for Es256Issuer {
             iss: self.issuer_url.clone(),
             sub,
             aud: req.audience,
-            amr: req.billets.clone(),
+            billet_claims: self.billet_claims.iter()
+                .map(|claim_name| (claim_name.clone(), req.billets.clone()))
+                .collect(),
             billets: req.billets,
             iat: now,
             exp,
@@ -183,7 +193,7 @@ mod tests {
         let issuer = Es256Issuer::new(
             manager.clone(),
             "https://qm.example.com".to_string(),
-            300,
+            300, vec![],
         );
 
         let req = IssueRequest {
@@ -236,7 +246,7 @@ mod tests {
         let issuer = Es256Issuer::new(
             manager,
             "https://qm.example.com".to_string(),
-            300,
+            300, vec![],
         );
 
         let req = IssueRequest {
@@ -259,7 +269,7 @@ mod tests {
         let issuer = Es256Issuer::new(
             manager,
             "https://qm.example.com".to_string(),
-            300,
+            300, vec![],
         );
 
         let req = IssueRequest {
@@ -280,7 +290,7 @@ mod tests {
         let issuer = Es256Issuer::new(
             manager,
             "https://qm.example.com".to_string(),
-            600,
+            600, vec![],
         );
 
         let req = IssueRequest {
@@ -302,7 +312,7 @@ mod tests {
         let issuer = Es256Issuer::new(
             manager,
             "https://qm.example.com".to_string(),
-            300,
+            300, vec![],
         );
 
         let req = IssueRequest {
@@ -385,7 +395,7 @@ mod tests {
                 let issuer = Es256Issuer::new(
                     manager,
                     "https://qm.example.com".to_string(),
-                    300,
+            300, vec![],
                 );
 
                 let mut jtis = std::collections::HashSet::new();
@@ -454,7 +464,7 @@ mod tests {
                 let issuer = Es256Issuer::new(
                     manager.clone(),
                     issuer_url.clone(),
-                    ttl,
+                    ttl, vec![],
                 );
 
                 let req = IssueRequest {
@@ -563,7 +573,7 @@ mod tests {
                 let issuer = Es256Issuer::new(
                     manager,
                     issuer_url.clone(),
-                    ttl,
+                    ttl, vec![],
                 );
 
                 let req = IssueRequest {

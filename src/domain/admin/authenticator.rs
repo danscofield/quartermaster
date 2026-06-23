@@ -241,7 +241,7 @@ mod tests {
         billets: Vec<String>,
         ttl_secs: u64,
     ) -> String {
-        let issuer = Es256Issuer::new(signing_manager, issuer_url.to_string(), ttl_secs);
+        let issuer = Es256Issuer::new(signing_manager, issuer_url.to_string(), ttl_secs, vec![]);
         let req = IssueRequest {
             spiffe_id: spiffe_id.to_string(),
             audience: issuer_url.to_string(),
@@ -317,7 +317,7 @@ mod tests {
             sub: "spiffe://example.com/workload".to_string(),
             aud: "https://qm.example.com".to_string(),
             billets: vec!["admin".to_string()],
-            amr: vec!["admin".to_string()],
+            billet_claims: std::collections::HashMap::new(),
             iat: now - 600,
             exp: now - 300, // expired 5 minutes ago
             jti: "test-jti".to_string(),

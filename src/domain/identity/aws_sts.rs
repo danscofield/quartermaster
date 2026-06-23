@@ -403,7 +403,7 @@ pub fn parse_assumed_role_arn(arn: &str) -> Result<AssumedRoleArn, IdentityError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    //use chrono::TimeZone;
 
     // ─── Host Validation Tests ─────────────────────────────────────────────
 

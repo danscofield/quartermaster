@@ -275,7 +275,7 @@ fn build_bootstrap_claims(
         iss: config.issuer.clone(),
         sub: "bootstrap:admin".to_string(),
         aud: config.issuer.clone(),
-        amr: billets.to_vec(),
+        billet_claims: std::collections::HashMap::new(),
         billets: billets.to_vec(),
         iat: now,
         exp: now + 600,
